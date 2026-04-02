@@ -64,6 +64,13 @@ HOUGH_THRESHOLD       = 20
 # Minimum Hough segments on one side to trust that detection
 MIN_SEGMENTS_TO_TRUST = 1
 
+
+# Width of the corridor kept visible around each line (pixels on each side).
+# Everything to the left of (CL - CORRIDOR_PX) and to the right of
+# (RL + CORRIDOR_PX) is blacked out in the binary mask before Hough runs.
+# TUNE THIS: wider = more tolerant of line movement, narrower = less noise
+CORRIDOR_PX = 40
+
 # Filters out near-horizontal segments (road texture, shadows)
 # TUNE THIS: lower if real lines are being filtered out
 MIN_SLOPE = 0.3
@@ -104,6 +111,11 @@ class StraightLaneNode(Node):
         self._prev_error = 0.0
         self._frame_num  = 0
 
+        # First accepted line equations — used to build the dynamic ROI mask.
+        # Set once on the first valid detection, then updated each accepted frame.
+        self._mask_cl_line = None
+        self._mask_rl_line = None
+
         # Open CSV log file — written every frame for post-run analysis
         self._log_file = open('/home/husarion/lane_log.csv', 'w')
         # CSV header: all 4 line points + geometry + controller output
@@ -141,6 +153,7 @@ class StraightLaneNode(Node):
         strip   = frame[strip_y:, :]
 
         binary  = self._segment_white(strip)
+        binary  = self._apply_corridor_mask(binary)
 
         cl_line, rl_line = self._fit_lane_lines(binary)
 
@@ -159,6 +172,12 @@ class StraightLaneNode(Node):
         # Mid point: where each fitted line crosses y = strip_h / 2 (middle of strip)
         cl_mid_x = (cl_line[0] * (sh / 2) + cl_line[1]) if cl_line else None
         rl_mid_x = (rl_line[0] * (sh / 2) + rl_line[1]) if rl_line else None
+
+        # Update corridor reference lines whenever points are accepted
+        if cl_top_x is not None:
+            self._mask_cl_line = cl_line
+        if rl_top_x is not None:
+            self._mask_rl_line = rl_line
 
         error, lane_centre_x = self._compute_error(cl_bot_x, rl_bot_x)
         self._control(error)
@@ -191,6 +210,46 @@ class StraightLaneNode(Node):
         mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel,
                                   iterations=MORPH_CLOSE_ITER)
         return mask
+
+
+    def _apply_corridor_mask(self, binary: np.ndarray) -> np.ndarray:
+        """
+        Blacks out everything outside a corridor around CL and RL.
+
+        The mask keeps three regions visible:
+        - CORRIDOR_PX pixels to the left and right of the CL line
+        - Everything between CL and RL (the lane interior)
+        - CORRIDOR_PX pixels to the left and right of the RL line
+
+        Everything outside those regions is set to black before Hough runs,
+        so noise far from the lines is never seen by the detector.
+
+        Only activates once the first valid detection has been stored in
+        self._mask_cl_line and self._mask_rl_line. Until then, the full
+        binary mask is passed through unchanged.
+        """
+        if self._mask_cl_line is None or self._mask_rl_line is None:
+            return binary   # first frame — no corridor yet, pass full mask
+
+        h, w = binary.shape
+        corridor = np.zeros_like(binary)   # start fully black
+
+        # For each row y, compute the x position of CL and RL at that row
+        for y in range(h):
+            cl_x = int(self._mask_cl_line[0] * y + self._mask_cl_line[1])
+            rl_x = int(self._mask_rl_line[0] * y + self._mask_rl_line[1])
+
+            # Left corridor: CORRIDOR_PX to the left of CL
+            left_start  = max(0, cl_x - CORRIDOR_PX)
+            # Right corridor: CORRIDOR_PX to the right of RL
+            right_end   = min(w, rl_x + CORRIDOR_PX)
+
+            # Keep everything from left_start to right_end visible
+            # This includes: left corridor + lane interior + right corridor
+            corridor[y, left_start:right_end] = 255
+
+        # AND with the original binary — only white pixels inside corridor survive
+        return cv2.bitwise_and(binary, corridor)
 
     # ─────────────────────────────────────────────────────────────────────────
     #  HOUGH LINE FITTING
