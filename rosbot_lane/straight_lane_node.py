@@ -31,7 +31,7 @@ import cv2
 import numpy as np
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import TwistStamped
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -82,15 +82,18 @@ MIN_SLOPE = 0.3
 SPLIT_FRACTION = 0.40
 
 # ── Controller ────────────────────────────────────────────────────────────────
-KP = 0.40
-KD = 0.05
+KP = 0.30
+KD = 0.02
 
 # Estimated lane width in pixels at strip level
 # TUNE THIS: measure pixel distance between CL dot and RL dot when both visible
 LANE_WIDTH_PX = 220
 
-DRIVE_SPEED        = 0.10
-MAX_ERROR_TO_DRIVE = 0.90
+DRIVE_SPEED        = 0.05
+MAX_ERROR_TO_DRIVE = 0.40
+
+# Number of consecutive frames with no detection before stopping
+NO_DETECTION_STOP_FRAMES = 10
 
 # ── Topics ────────────────────────────────────────────────────────────────────
 TOPIC_IMAGE   = '/oak/rgb/image_raw'
@@ -110,6 +113,9 @@ class StraightLaneNode(Node):
         self.bridge      = CvBridge()
         self._prev_error = 0.0
         self._frame_num  = 0
+
+        # Initializing the count of undetected lane frames
+        self._no_detection_count = 0
 
         # First accepted line equations — used to build the dynamic ROI mask.
         # Set once on the first valid detection, then updated each accepted frame.
@@ -133,7 +139,7 @@ class StraightLaneNode(Node):
         )
 
         self.create_subscription(Image, TOPIC_IMAGE, self._image_cb, sensor_qos)
-        self._cmd_pub = self.create_publisher(Twist, TOPIC_CMD_VEL, 10)
+        self._cmd_pub = self.create_publisher(TwistStamped, TOPIC_CMD_VEL, 10)
 
         self.get_logger().info(f'Subscribed to {TOPIC_IMAGE}')
         self.get_logger().info(f'Publishing  to {TOPIC_CMD_VEL}')
@@ -148,7 +154,7 @@ class StraightLaneNode(Node):
             self.get_logger().error(f'cv_bridge: {e}')
             return
 
-        frame   = cv2.resize(frame, (IMG_W, IMG_H))
+        # frame   = cv2.resize(frame, (IMG_W, IMG_H))
         strip_y = int(IMG_H * STRIP_TOP_FRACTION)
         strip   = frame[strip_y:, :]
 
@@ -180,7 +186,18 @@ class StraightLaneNode(Node):
             self._mask_rl_line = rl_line
 
         error, lane_centre_x = self._compute_error(cl_bot_x, rl_bot_x)
-        self._control(error)
+
+        # Calling the controls of the vehicle
+        if cl_bot_x is None and rl_bot_x is None:
+            self._no_detection_count += 1
+            if self._no_detection_count >= NO_DETECTION_STOP_FRAMES:
+                stop = TwistStamped()
+                stop.header.stamp = self.get_clock().now().to_msg()
+                self._cmd_pub.publish(stop)
+        else:
+            self._no_detection_count = 0        # reset counter when lines are visible
+            self._control(error)
+
 
         # Write one CSV row per frame
         def v(x): return f'{x:.2f}' if x is not None else ''
@@ -403,7 +420,8 @@ class StraightLaneNode(Node):
     # ─────────────────────────────────────────────────────────────────────────
 
     def _control(self, error: float):
-        twist = Twist()
+        twist = TwistStamped()
+        twist.header.stamp = self.get_clock().now().to_msg()
 
         if abs(error) > MAX_ERROR_TO_DRIVE:
             self.get_logger().warn(
@@ -417,9 +435,10 @@ class StraightLaneNode(Node):
         angular_z        = KP * error + KD * d_error
         self._prev_error = error
 
-        twist.linear.x  = DRIVE_SPEED
-        twist.angular.z = float(np.clip(angular_z, -1.5, 1.5))
+        twist.twist.linear.x  = DRIVE_SPEED
+        twist.twist.angular.z = float(np.clip(angular_z, -1.5, 1.5))
         self._cmd_pub.publish(twist)
+
 
     # ─────────────────────────────────────────────────────────────────────────
     #  DEBUG
@@ -537,7 +556,8 @@ def main(args=None):
     except KeyboardInterrupt:
         node.get_logger().info('Shutting down.')
     finally:
-        stop = Twist()
+        stop = TwistStamped()
+        stop.header.stamp = node.get_clock().now().to_msg()
         node._cmd_pub.publish(stop)
         node._log_file.close()
         node.destroy_node()
