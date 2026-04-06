@@ -89,7 +89,7 @@ KD = 0.02
 # TUNE THIS: measure pixel distance between CL dot and RL dot when both visible
 LANE_WIDTH_PX = 220
 
-DRIVE_SPEED        = 0.05
+DRIVE_SPEED        = 0.20
 MAX_ERROR_TO_DRIVE = 0.40
 
 # Number of consecutive frames with no detection before stopping
