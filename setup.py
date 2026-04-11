@@ -24,7 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'lane_perception_node = rosbot_lane.lane_perception_node:main',
+            'lane_keeping_node = rosbot_lane.lane_keeping_node:main',
             'straight_lane_node = rosbot_lane.straight_lane_node:main',
         ],
     },
