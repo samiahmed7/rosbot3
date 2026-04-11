@@ -1,0 +1,42 @@
+# Image geometry
+image:
+  width: 768
+  height: 432
+  strip_top_fraction: 0.72
+
+# White segmentation
+segmentation:
+  hsv_low: [0, 0, 170]
+  hsv_high: [180, 45, 255]
+  morph_close_iterations: 2
+
+# Hough parameters
+hough:
+  min_line_length: 30
+  max_line_gap: 15
+  threshold: 20
+  min_segments_to_trust: 1
+  min_slope: 0.3
+
+# Lane detection
+detection:
+  corridor_px: 40
+  split_fraction: 0.40
+  lane_width_px: 220
+
+# Controller
+control:
+  kp: 0.30
+  kd: 0.02
+  drive_speed: 0.20
+  max_error_to_drive: 0.40
+  no_detection_stop_frames: 10
+
+# Topics
+topics:
+  image: '/oak/rgb/image_raw'
+  cmd_vel: '/cmd_vel'
+
+# Debug
+debug:
+  show_display: true
