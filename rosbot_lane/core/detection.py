@@ -1,5 +1,4 @@
 """Lane line detection using Hough transform."""
-
 import cv2
 import numpy as np
 from typing import Tuple, Optional, List
@@ -19,14 +18,25 @@ def fit_lane_lines(
 ) -> Tuple[Optional[Line], Optional[Line]]:
     """
     Detect CL and RL using Hough transform.
-    
-    Returns (cl_line, rl_line) where each is (slope, intercept) or None.
-    Line equation: x = slope * y + intercept
-    """
-    h, w = binary.shape
-    cx = img_width / 2.0
 
-    segments = cv2.HoughLinesP(
+    Returns (cl_line, rl_line) where each is (slope, intercept) or None.
+    """
+    segments = _get_hough_segments(binary, hough_threshold, min_line_length, max_line_gap)
+
+    cl_line = detect_cl(binary, segments, img_width, min_slope, min_segments)
+    rl_line = detect_rl(binary, segments, img_width, min_slope, min_segments)
+
+    return cl_line, rl_line
+
+
+def _get_hough_segments(
+    binary: np.ndarray,
+    hough_threshold: int,
+    min_line_length: int,
+    max_line_gap: int
+) -> Optional[np.ndarray]:
+    """Run HoughLinesP and return raw segments."""
+    return cv2.HoughLinesP(
         binary,
         rho=1,
         theta=np.pi / 180,
@@ -35,33 +45,85 @@ def fit_lane_lines(
         maxLineGap=max_line_gap
     )
 
-    left_candidates = []   # CL candidates (left of centre)
-    right_candidates = []  # RL candidates (right of centre)
 
-    if segments is not None:
-        for seg in segments:
-            x1, y1, x2, y2 = seg[0]
-            dy = float(y2 - y1)
-            dx = float(x2 - x1)
+def detect_rl(
+    binary: np.ndarray,
+    segments: Optional[np.ndarray],
+    img_width: int,
+    min_slope: float = 0.3,
+    min_segments: int = 1
+) -> Optional[Line]:
+    """
+    Detect right lane line (solid).
 
-            if abs(dx) < 1e-6 or abs(dy) < 1e-6:
-                continue
-            if abs(dy / dx) < min_slope:
-                continue
+    Returns (slope, intercept) or None.
+    """
+    if segments is None:
+        return None
 
-            slope = dx / dy
-            intercept = x1 - slope * y1
-            bottom_x = slope * h + intercept
+    h, w = binary.shape
+    cx = img_width / 2.0
 
-            if bottom_x < cx:
-                left_candidates.append((bottom_x, slope, intercept))
-            else:
-                right_candidates.append((bottom_x, slope, intercept))
+    candidates = []
+    for seg in segments:
+        x1, y1, x2, y2 = seg[0]
+        dy = float(y2 - y1)
+        dx = float(x2 - x1)
 
-    cl_line = _pick_best_line(left_candidates, closest_to='right', min_segments=min_segments)
-    rl_line = _pick_best_line(right_candidates, closest_to='left', min_segments=min_segments)
+        if abs(dx) < 1e-6 or abs(dy) < 1e-6:
+            continue
+        if abs(dy / dx) < min_slope:
+            continue
 
-    return cl_line, rl_line
+        slope = dx / dy
+        intercept = x1 - slope * y1
+        bottom_x = slope * h + intercept
+
+        # RL: right of center
+        if bottom_x >= cx:
+            candidates.append((bottom_x, slope, intercept))
+
+    return _pick_best_line(candidates, closest_to='left', min_segments=min_segments)
+
+
+def detect_cl(
+    binary: np.ndarray,
+    segments: Optional[np.ndarray],
+    img_width: int,
+    min_slope: float = 0.3,
+    min_segments: int = 1
+) -> Optional[Line]:
+    """
+    Detect centre lane line (dashed).
+
+    Returns (slope, intercept) or None.
+    """
+    if segments is None:
+        return None
+
+    h, w = binary.shape
+    cx = img_width / 2.0
+
+    candidates = []
+    for seg in segments:
+        x1, y1, x2, y2 = seg[0]
+        dy = float(y2 - y1)
+        dx = float(x2 - x1)
+
+        if abs(dx) < 1e-6 or abs(dy) < 1e-6:
+            continue
+        if abs(dy / dx) < min_slope:
+            continue
+
+        slope = dx / dy
+        intercept = x1 - slope * y1
+        bottom_x = slope * h + intercept
+
+        # CL: left of center
+        if bottom_x < cx:
+            candidates.append((bottom_x, slope, intercept))
+
+    return _pick_best_line(candidates, closest_to='right', min_segments=min_segments)
 
 
 def _pick_best_line(
