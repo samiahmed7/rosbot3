@@ -5,6 +5,8 @@ from typing import Tuple, Optional, List
 
 # Type alias for line: (slope, intercept) where x = slope * y + intercept
 Line = Tuple[float, float]
+# Type alias for polynomial: [A, B, C] where x = Ay² + By + C
+Poly = np.ndarray
 
 
 def fit_lane_lines(
@@ -36,7 +38,7 @@ def _get_hough_segments(
     max_line_gap: int
 ) -> Optional[np.ndarray]:
     """Run HoughLinesP and return raw segments."""
-    return cv2.HoughLinesP(
+    segments = cv2.HoughLinesP(
         binary,
         rho=1,
         theta=np.pi / 180,
@@ -44,7 +46,51 @@ def _get_hough_segments(
         minLineLength=min_line_length,
         maxLineGap=max_line_gap
     )
+    return segments
 
+def _sliding_window(
+    binary: np.ndarray,
+    start_x: int,
+    n_windows: int = 20,
+    margin: int = 80,
+    min_pixels_recenter: int = 30,
+    min_pixels_to_fit: int = 50
+) -> Optional[Poly]:
+    """
+    Sliding window search from start_x, bottom to top.
+
+    Returns polynomial [A, B, C] or None if not enough pixels.
+    """
+    h, w = binary.shape
+    nzy, nzx = binary.nonzero()
+
+    current_x = start_x
+    window_h = h // n_windows
+    pixel_indices = []
+
+    for win in range(n_windows):
+        y_lo = h - (win + 1) * window_h
+        y_hi = h - win * window_h
+        x_lo = max(0, current_x - margin)
+        x_hi = min(w, current_x + margin)
+
+        inds = np.where(
+            (nzy >= y_lo) & (nzy < y_hi) &
+            (nzx >= x_lo) & (nzx < x_hi)
+        )[0]
+
+        pixel_indices.append(inds)
+
+        if len(inds) > min_pixels_recenter:
+            current_x = int(np.mean(nzx[inds]))
+
+    all_inds = np.concatenate(pixel_indices)
+
+    if len(all_inds) < min_pixels_to_fit:
+        return None
+
+    # Fit polynomial: x = Ay² + By + C
+    return np.polyfit(nzy[all_inds], nzx[all_inds], 2)
 
 def detect_rl(
     binary: np.ndarray,
@@ -52,11 +98,11 @@ def detect_rl(
     img_width: int,
     min_slope: float = 0.3,
     min_segments: int = 1
-) -> Optional[Line]:
+) -> Optional[Poly]:
     """
-    Detect right lane line (solid).
+    Detect right lane line (solid) using polynomial fitting.
 
-    Returns (slope, intercept) or None.
+    Returns [A, B, C] where x = Ay² + By + C, or None.
     """
     if segments is None:
         return None
@@ -64,6 +110,7 @@ def detect_rl(
     h, w = binary.shape
     cx = img_width / 2.0
 
+    # Step 1: Use Hough segments to find starting position
     candidates = []
     for seg in segments:
         x1, y1, x2, y2 = seg[0]
@@ -81,10 +128,28 @@ def detect_rl(
 
         # RL: right of center
         if bottom_x >= cx:
-            candidates.append((bottom_x, slope, intercept))
+            candidates.append(bottom_x)
+    if not candidates:
+        return None
 
-    return _pick_best_line(candidates, closest_to='left', min_segments=min_segments)
+    # Step 2: Pick leftmost candidate (closest to center)
+    candidates.sort()
+    start_x = int(candidates[0])
 
+    # Step 3: Sliding window + polynomial fit
+    poly = _sliding_window(binary, start_x)
+    return poly
+
+
+    if not candidates:
+        return None
+
+    # Step 2: Pick leftmost candidate (closest to center)
+    candidates.sort()
+    start_x = int(candidates[0])
+
+    # Step 3: Sliding window + polynomial fit
+    return _sliding_window(binary, start_x)
 
 def detect_cl(
     binary: np.ndarray,
@@ -154,7 +219,7 @@ def _pick_best_line(
 def apply_corridor_mask(
     binary: np.ndarray,
     cl_line: Optional[Line],
-    rl_line: Optional[Line],
+    rl_line,  # Can be Line (tuple) or Poly (ndarray)
     corridor_px: int
 ) -> np.ndarray:
     """Mask out pixels outside corridor around CL and RL."""
@@ -165,15 +230,25 @@ def apply_corridor_mask(
     corridor = np.zeros_like(binary)
 
     for y in range(h):
+        # CL is still Hough line: x = slope * y + intercept
         cl_x = int(cl_line[0] * y + cl_line[1])
-        rl_x = int(rl_line[0] * y + rl_line[1])
+
+        # RL is polynomial: x = Ay² + By + C
+        if isinstance(rl_line, np.ndarray) and len(rl_line) == 3:
+            rl_x = int(rl_line[0] * y**2 + rl_line[1] * y + rl_line[2])
+        else:
+            rl_x = int(rl_line[0] * y + rl_line[1])
+
         left_start = max(0, cl_x - corridor_px)
         right_end = min(w, rl_x + corridor_px)
         corridor[y, left_start:right_end] = 255
 
     return cv2.bitwise_and(binary, corridor)
 
-
 def eval_line_at_y(line: Line, y: float) -> float:
     """Evaluate x position of line at given y."""
     return line[0] * y + line[1]
+
+def eval_poly_at_y(poly: Poly, y: float) -> float:
+    """Evaluate x position of polynomial at given y."""
+    return poly[0] * y**2 + poly[1] * y + poly[2]

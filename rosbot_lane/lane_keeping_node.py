@@ -12,7 +12,7 @@ from geometry_msgs.msg import TwistStamped
 
 from rosbot_lane.core.config import load_config
 from rosbot_lane.core.segmentation import segment_white
-from rosbot_lane.core.detection import fit_lane_lines, apply_corridor_mask, eval_line_at_y
+from rosbot_lane.core.detection import fit_lane_lines, apply_corridor_mask, eval_line_at_y, eval_poly_at_y
 from rosbot_lane.core.geometry import compute_lane_error
 from rosbot_lane.core.control import LaneController
 from rosbot_lane.core.logging import LaneLogger
@@ -81,9 +81,9 @@ class LaneKeepingNode(Node):
         cl_top_x = eval_line_at_y(cl_line, 0) if cl_line else None
         cl_mid_x = eval_line_at_y(cl_line, sh / 2) if cl_line else None
         cl_bot_x = eval_line_at_y(cl_line, sh) if cl_line else None
-        rl_top_x = eval_line_at_y(rl_line, 0) if rl_line else None
-        rl_mid_x = eval_line_at_y(rl_line, sh / 2) if rl_line else None
-        rl_bot_x = eval_line_at_y(rl_line, sh) if rl_line else None
+        rl_top_x = eval_poly_at_y(rl_line, 0) if rl_line is not None else None
+        rl_mid_x = eval_poly_at_y(rl_line, sh / 2) if rl_line is not None else None
+        rl_bot_x = eval_poly_at_y(rl_line, sh) if rl_line is not None else None
 
         # Update corridor references
         if cl_top_x is not None:

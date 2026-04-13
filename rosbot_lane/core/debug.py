@@ -30,13 +30,13 @@ def draw_debug_frame(
     strip_vis = strip.copy()
 
     # Draw lines and points
-    if cl_line:
+    if cl_line is not None:
         _draw_line(strip_vis, cl_line, sh, (255, 255, 0))
         _draw_point(strip_vis, cl_top_x, 5, 'CL_T', (255, 255, 0))
         _draw_point(strip_vis, cl_mid_x, sh // 2, 'CL_M', (255, 255, 0))
         _draw_point(strip_vis, cl_bot_x, sh - 5, 'CL_B', (255, 255, 0))
 
-    if rl_line:
+    if rl_line is not None:
         _draw_line(strip_vis, rl_line, sh, (0, 255, 255))
         _draw_point(strip_vis, rl_top_x, 5, 'RL_T', (0, 255, 255))
         _draw_point(strip_vis, rl_mid_x, sh // 2, 'RL_M', (0, 255, 255))
@@ -67,12 +67,25 @@ def draw_debug_frame(
     cv2.waitKey(1)
 
 
-def _draw_line(img: np.ndarray, line: Line, sh: int, color: Tuple[int, int, int]):
-    slope, intercept = line
-    x_top = int(slope * 0 + intercept)
-    x_bot = int(slope * sh + intercept)
-    cv2.line(img, (x_top, 0), (x_bot, sh), color, 2)
+def _draw_line(img: np.ndarray, line, sh: int, color: Tuple[int, int, int]):
+    if line is None:
+        return
 
+    if isinstance(line, np.ndarray) and len(line) == 3:
+        # Polynomial: x = Ay² + By + C
+        pts = []
+        for y in range(0, sh, 5):
+            x = int(line[0] * y**2 + line[1] * y + line[2])
+            if 0 <= x < img.shape[1]:
+                pts.append((x, y))
+        for i in range(len(pts) - 1):
+            cv2.line(img, pts[i], pts[i+1], color, 2)
+    else:
+        # Hough: x = slope * y + intercept
+        slope, intercept = line
+        x_top = int(slope * 0 + intercept)
+        x_bot = int(slope * sh + intercept)
+        cv2.line(img, (x_top, 0), (x_bot, sh), color, 2)
 
 def _draw_point(img: np.ndarray, x: Optional[float], y: int, label: str, color: Tuple[int, int, int]):
     if x is None:
