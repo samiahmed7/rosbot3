@@ -97,11 +97,11 @@ class LaneKeepingNode(Node):
         )
 
         # Control
-        if cl_bot_x is None and rl_bot_x is None:
+        if cl_bot_x is None or rl_bot_x is None:
             self._no_detection_count += 1
             if self._no_detection_count >= self.cfg.no_detection_stop_frames:
                 self._stop()
-                self.get_logger().warn('No lane lines detected', throttle_duration_sec=1.0)
+                self.get_logger().warn('Both lane lines not detected', throttle_duration_sec=1.0)
         else:
             self._no_detection_count = 0
             self._drive(error)
