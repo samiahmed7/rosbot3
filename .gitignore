@@ -7,4 +7,15 @@ log/
 *.pyc
 rosbag
 
+/config/trajectories/
+/rosbot_lane/temp/
 /rosbot_lane/temp.txt
+
+
+README.md
+config/amcl_params.yaml
+config/track_map.data
+config/track_map.pgm
+config/track_map.posegraph
+config/track_map.yaml
+rosbot_lane/tf_relay.py

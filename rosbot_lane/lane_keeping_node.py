@@ -19,7 +19,7 @@ from rosbot_lane.core.logging import LaneLogger
 from rosbot_lane.core.debug import draw_debug_frame
 
 
-CONFIG_PATH = '/home/husarion/rosbot_ws/src/rosbot_lane/config/lane_params.yaml'
+CONFIG_PATH = '/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/config/lane_params.yaml'
 
 
 class LaneKeepingNode(Node):
@@ -39,7 +39,7 @@ class LaneKeepingNode(Node):
 
         # Core modules
         self.controller = LaneController(self.cfg.kp, self.cfg.kd)
-        self.logger = LaneLogger('/home/husarion/lane_log.csv')
+        self.logger = LaneLogger('/home/sharjeel-ahmad/Documents/lane_log.csv')
 
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,

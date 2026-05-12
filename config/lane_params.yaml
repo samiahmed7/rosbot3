@@ -34,8 +34,8 @@ control:
 
 # Topics
 topics:
-  image: '/oak/rgb/image_raw'
-  cmd_vel: '/cmd_vel'
+  image: '/rosbot3/oak/rgb/image_raw'
+  cmd_vel: '/rosbot3/cmd_vel'
 
 # Debug
 debug:
