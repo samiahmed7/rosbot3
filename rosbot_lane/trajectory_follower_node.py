@@ -85,7 +85,7 @@ class TrajectoryFollowerNode(Node):
         # Overtake: detour-list approach
         self._overtake_rejoin_distance = 2.0    # m — how far along recorded path the detour rejoins
         #self._overtake_lateral_offset = 0.5     # m — peak lateral offset of the bump
-        self._overtake_max_curve = math.radians(20.0)  # max heading change allowed to trigger overtake
+        self._overtake_max_curve = math.radians(15.0)  # max heading change allowed to trigger overtake
         self._overtake_num_points = 20          # detour resolution
         self._overtake_finish_tolerance = 0.22  # m — "reached rejoin point E"
 
@@ -471,18 +471,22 @@ class TrajectoryFollowerNode(Node):
         # Obstacle check (forward only — reverse skipped per design)
         if not is_reverse:
             obstacle_scale, should_stop = self._check_obstacle()
-            if should_stop:
-                self._stop()
-                return
         else:
             obstacle_scale = 1.0
-        
-        # Track time in slow mode for overtake trigger
-        dt = 0.05  # control loop period
-        if obstacle_scale < 1.0:
+            should_stop = False
+
+        # Track time in slow mode for overtake trigger.
+        # Must happen BEFORE the early-return so the timer accumulates
+        # during a full stop, not just in the decel band.
+        dt = 0.05
+        if not is_reverse and (obstacle_scale < 1.0 or should_stop):
             self._slowdown_timer += dt
         else:
             self._slowdown_timer = 0.0
+
+        if should_stop:
+            self._stop()
+            return
 
         # If we've been slowed for long enough AND the left lane is clear, overtake
         if (self._slowdown_timer >= self._overtake_trigger_time
@@ -499,7 +503,7 @@ class TrajectoryFollowerNode(Node):
                 # don't fall through to overtake; just continue current behavior
             else:
                 # --- NEW STRAIGHTNESS CHECK ---
-                curr_idx = self._trajectory.current_wp_idx
+                curr_idx = self._trajectory.find_closest_waypoint(self._x, self._y)
                 theta_curr = self._trajectory.tangent_at(curr_idx)
                 theta_rejoin = self._trajectory.tangent_at(rejoin_idx)
                 
