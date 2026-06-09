@@ -18,4 +18,3 @@ config/track_map.data
 config/track_map.pgm
 config/track_map.posegraph
 config/track_map.yaml
-rosbot_lane/tf_relay.py
