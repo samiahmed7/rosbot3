@@ -108,3 +108,52 @@ chmod +x src/rosbot_lane/rosbot_lane/*.py
 chmod +x src/rosbot_lane/rosbot_lane/core/*.py
 
 ```
+
+
+
+T1:
+python3 ~/Documents/rosbot_ws/src/rosbot_lane/rosbot_lane/tf_relay.py
+
+T2:
+ros2 launch nav2_bringup localization_launch.py \
+  map:=/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/config/track_map.yaml \
+  params_file:=/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/config/amcl_params.yaml \
+  use_sim_time:=false
+  
+T3:
+# Activate lifecycle nodes
+ros2 lifecycle set /map_server configure
+ros2 lifecycle set /map_server activate
+ros2 lifecycle set /amcl configure
+ros2 lifecycle set /amcl activate
+
+# Global localization (find robot on map)
+ros2 service call /reinitialize_global_localization std_srvs/srv/Empty
+
+T4:
+
+
+
+
+
+
+
+
+
+
+recording:
+python3 ~/Documents/rosbot_ws/src/rosbot_lane/rosbot_lane/tf_relay.py
+
+ros2 launch slam_toolbox online_async_launch.py \
+  slam_params_file:=/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/config/slam_params.yaml \
+  use_sim_time:=false
+  
+python3 ~/Documents/rosbot_ws/src/rosbot_lane/rosbot_lane/temp/slam_trajectory_recorder.py
+
+ros2 run teleop_twist_keyboard teleop_twist_keyboard \
+  --ros-args -r cmd_vel:=/rosbot3/cmd_vel -p stamped:=true
+ 
+ros2 run nav2_map_server map_saver_cli -f ~/Documents/rosbot_ws/src/rosbot_lane/config/track_map
+
+ros2 service call /slam_toolbox/serialize_map slam_toolbox/srv/SerializePoseGraph \
+  "{filename: '/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/config/track_map'}"
