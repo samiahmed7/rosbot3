@@ -36,7 +36,7 @@ class State(Enum):
     SEGMENT_TRANSITION = 5
     ALIGN_AT_END = 6
     OVERTAKING = 7
-    COMPLETE = 7
+    COMPLETE = 8
 
 
 class TrajectoryFollowerNode(Node):
@@ -67,16 +67,16 @@ class TrajectoryFollowerNode(Node):
         self._segment_goal_tolerance = 0.15
 
         # Segment-following lookahead distances (arc length along path)
-        self._lookahead_forward = 0.35   # m
-        self._lookahead_reverse = 0.20   # m — tighter for reverse for better tracking
+        self._lookahead_forward = 0.25   # m
+        self._lookahead_reverse = 0.15   # m — tighter for reverse for better tracking
 
         # Lane corridor for obstacle detection (forward only)
         self._lane_width = 0.50            # m — robot footprint + small margin
-        self._lane_max_lookahead = 2.0     # m — only flag obstacles within this forward distance
+        self._lane_max_lookahead = 2.5     # m — only flag obstacles within this forward distance
 
         # Overtaking (left side, German convention)
         self._overtake_trigger_time = 1.5        # s — must be in slow mode this long before triggering
-        self._overtake_lateral_offset = 0.5      # m — how far left of the recorded path to swerve
+        self._overtake_lateral_offset = 0.35      # m — how far left of the recorded path to swerve
         self._overtake_check_forward = 2.0       # m — verify left lane clear at least this far ahead
         self._overtake_phase_duration = 1.5      # s — OUT and IN ramp durations
         self._overtake_pass_distance = 1.0       # m — distance to travel in PASS before merging back
@@ -84,9 +84,9 @@ class TrajectoryFollowerNode(Node):
 
         # Overtake: detour-list approach
         self._overtake_rejoin_distance = 2.0    # m — how far along recorded path the detour rejoins
-        self._overtake_lateral_offset = 0.5     # m — peak lateral offset of the bump
+        #self._overtake_lateral_offset = 0.5     # m — peak lateral offset of the bump
         self._overtake_num_points = 20          # detour resolution
-        self._overtake_finish_tolerance = 0.15  # m — "reached rejoin point E"
+        self._overtake_finish_tolerance = 0.22  # m — "reached rejoin point E"
 
         # Active detour (empty when not overtaking)
         self._overtake_path = []                # list of (x, y) tuples

@@ -23,8 +23,8 @@ class PurePursuitConfig:
     # Rotate first threshold (forward only)
     rotate_first_threshold: float = 0.3  # ~17 degrees
     
-    goal_tolerance: float = 0.12
-    angle_tolerance: float = 0.10
+    goal_tolerance: float = 0.01
+    angle_tolerance: float = 0.05
 
 
 class PurePursuitController:
@@ -44,6 +44,8 @@ class PurePursuitController:
         current_theta: float,
         target_x: float,
         target_y: float,
+        target_theta: float = None,
+        local_curvature: float = 0.0,
         is_reverse: bool = False,
         speed_factor: float = 1.0
     ) -> Tuple[float, float, float, float, bool]:
@@ -55,35 +57,55 @@ class PurePursuitController:
         if distance < self.cfg.goal_tolerance:
             return 0.0, 0.0, distance, 0.0, True
         
-        angle_to_target = math.atan2(dy, dx)
-        
-        # Heading error depends on drive direction
+        # --- Single source of truth: "effective" heading for the geometry math ---
+        # For reverse, pretend the robot is facing the opposite direction so all
+        # downstream math is identical to the forward case.
         if is_reverse:
-            # Back of robot points at target → desired heading is rotated 180°
-            desired_heading = self._normalize_angle(angle_to_target + math.pi)
-            heading_error = self._normalize_angle(desired_heading - current_theta)
+            effective_theta = self._normalize_angle(current_theta + math.pi)
             base_speed = self.cfg.reverse_speed
         else:
-            heading_error = self._normalize_angle(angle_to_target - current_theta)
+            effective_theta = current_theta
             base_speed = self.cfg.max_speed
         
-        # Pure Pursuit curvature — uses ACTUAL distance to lookahead point
-        if distance > 0.01:
-            curvature = 2.0 * math.sin(heading_error) / distance
-        else:
-            curvature = 0.0
+        # Position error: from "effective" heading to direction-to-target
+        angle_to_target = math.atan2(dy, dx)
+        position_error = self._normalize_angle(angle_to_target - effective_theta)
         
-        # Smooth speed scaling: cos(err) is 1.0 aligned, 0.5 at 60°, 0 at 90°.
-        # Floor at 0.3 so it never freezes mid-curve.
-        speed_scale = max(0.3, math.cos(heading_error))
+        # Heading-track error: from "effective" heading to the recorded heading
+        # at the lookahead point. Recorded theta is already in the natural travel
+        # direction for both forward and reverse legs (because reverse legs were
+        # recorded with theta pointing opposite travel — but we've already flipped
+        # effective_theta by π, so the comparison is direct).
+        if target_theta is not None:
+            if is_reverse:
+                # Flip recorded heading too so both are in "travel direction" frame
+                desired_theta = self._normalize_angle(target_theta + math.pi)
+            else:
+                desired_theta = target_theta
+            heading_track_error = self._normalize_angle(desired_theta - effective_theta)
+        else:
+            heading_track_error = position_error
+        
+        # Blend ratio: more heading-tracking in curves
+        if local_curvature > self.cfg.curve_blend_threshold:
+            blend = self.cfg.heading_blend_curve
+        else:
+            blend = self.cfg.heading_blend
+        
+        combined_error = (1.0 - blend) * position_error + blend * heading_track_error
+        
+        # Speed scaling on position error (geometric pull)
+        speed_scale = max(0.5, math.cos(position_error))
         linear_magnitude = base_speed * speed_factor * speed_scale
         linear_magnitude = max(self.cfg.min_speed, min(linear_magnitude, base_speed))
         
+        # Flip linear sign for reverse (the only place we care about direction)
         linear = -linear_magnitude if is_reverse else linear_magnitude
-        angular = curvature * linear_magnitude
+        
+        angular = self.cfg.kp_angular * combined_error
         angular = max(-self.cfg.max_angular, min(self.cfg.max_angular, angular))
         
-        return linear, angular, distance, heading_error, False
+        return linear, angular, distance, position_error, False
     
     def compute_align_control(
         self,
