@@ -29,12 +29,13 @@ from rosbot_lane.core.trajectory import Trajectory
 
 class State(Enum):
     WAITING_FOR_LOCALIZATION = 0
-    GO_TO_START = 1
-    ALIGN_AT_START = 2
-    FOLLOWING_SEGMENT = 3  # Follow current segment toward its goal (flip point)
-    SEGMENT_TRANSITION = 4  # Brief pause/align between segments
-    ALIGN_AT_END = 5
-    COMPLETE = 6
+    ROTATE_TO_START = 1
+    DRIVE_TO_START = 2
+    ALIGN_AT_START = 3
+    FOLLOWING_SEGMENT = 4
+    SEGMENT_TRANSITION = 5
+    ALIGN_AT_END = 6
+    COMPLETE = 7
 
 
 class TrajectoryFollowerNode(Node):
@@ -63,6 +64,10 @@ class TrajectoryFollowerNode(Node):
         
         # Segment transition tolerance
         self._segment_goal_tolerance = 0.15
+
+        # Segment-following lookahead distances (arc length along path)
+        self._lookahead_forward = 0.35   # m
+        self._lookahead_reverse = 0.20   # m — tighter for reverse for better tracking
         
         # LIDAR config (LIDAR is backwards - front at ±π)
         self._front_angle_range = math.radians(30)
@@ -79,6 +84,13 @@ class TrajectoryFollowerNode(Node):
         
         # State
         self._state = State.WAITING_FOR_LOCALIZATION
+
+        # GO_TO_START tuning (three-phase: ROTATE → DRIVE → ALIGN)
+        self._start_pos_tolerance = 0.10          # m — "close enough" to start
+        self._rotate_exit_threshold = 0.08        # rad (~5°)  — tight, exits rotate
+        self._rotate_reentry_threshold = 0.40     # rad (~23°) — loose, re-enters rotate (hysteresis!)
+        self._drive_to_start_speed = 0.12         # m/s — constant forward speed
+        self._drive_heading_kp = 0.8              # gentle correction while driving
         
         # Pose
         self._x = 0.0
@@ -147,14 +159,16 @@ class TrajectoryFollowerNode(Node):
             return
         
         if self._state == State.WAITING_FOR_LOCALIZATION:
-            self._state = State.GO_TO_START
+            self._state = State.ROTATE_TO_START   # ← was State.GO_TO_START
             self.get_logger().info(f'Localized at ({self._x:.2f}, {self._y:.2f}, θ={math.degrees(self._theta):.1f}°)')
             self.get_logger().info(f'Start: ({self._trajectory.start.x:.2f}, {self._trajectory.start.y:.2f})')
             return
         
         # State machine
-        if self._state == State.GO_TO_START:
-            self._handle_go_to_start()
+        if self._state == State.ROTATE_TO_START:
+            self._handle_rotate_to_start()
+        elif self._state == State.DRIVE_TO_START:
+            self._handle_drive_to_start()
         elif self._state == State.ALIGN_AT_START:
             self._handle_align_at_start()
         elif self._state == State.FOLLOWING_SEGMENT:
@@ -164,29 +178,85 @@ class TrajectoryFollowerNode(Node):
         elif self._state == State.ALIGN_AT_END:
             self._handle_align_at_end()
 
-    def _handle_go_to_start(self):
-        """Navigate to trajectory start."""
+    def _handle_rotate_to_start(self):
+        """Phase 1: rotate in place until facing the start point."""
         start = self._trajectory.start
+        dx = start.x - self._x
+        dy = start.y - self._y
+        dist = math.hypot(dx, dy)
         
-        linear, angular, distance, heading_error, reached = self._controller.compute_control(
-            self._x, self._y, self._theta,
-            start.x, start.y,
-            is_reverse=False,
-            speed_factor=1.0
-        )
-        
-        if reached:
+        # Already at the start — skip the drive phase entirely
+        if dist < self._start_pos_tolerance:
             self._stop()
             self._state = State.ALIGN_AT_START
-            self.get_logger().info('Reached start, aligning...')
+            self.get_logger().info(f'Already at start (dist={dist:.2f}m), aligning to recorded heading...')
             return
         
+        angle_to_start = math.atan2(dy, dx)
+        heading_error = self._normalize_angle(angle_to_start - self._theta)
+        
+        # Exit when well-aligned (tight threshold)
+        if abs(heading_error) < self._rotate_exit_threshold:
+            self._stop()
+            self._state = State.DRIVE_TO_START
+            self.get_logger().info(
+                f'Aimed at start (err={math.degrees(heading_error):.1f}°, dist={dist:.2f}m), driving...'
+            )
+            return
+        
+        angular = self._controller.cfg.kp_angular * heading_error
+        angular = max(-self._controller.cfg.max_angular,
+                    min(self._controller.cfg.max_angular, angular))
+        self._publish_cmd(0.0, angular)
+        
+        self.get_logger().info(
+            f'[ROTATE_TO_START] Dist: {dist:.2f}m | Err: {math.degrees(heading_error):.1f}°',
+            throttle_duration_sec=0.5
+        )
+
+    def _handle_drive_to_start(self):
+        """Phase 2: drive straight to start with mild heading correction."""
+        start = self._trajectory.start
+        dx = start.x - self._x
+        dy = start.y - self._y
+        dist = math.hypot(dx, dy)
+        
+        # Reached start position — go to final alignment
+        if dist < self._start_pos_tolerance:
+            self._stop()
+            self._state = State.ALIGN_AT_START
+            self.get_logger().info(f'Reached start (dist={dist:.2f}m), aligning to recorded heading...')
+            return
+        
+        angle_to_start = math.atan2(dy, dx)
+        heading_error = self._normalize_angle(angle_to_start - self._theta)
+        
+        # Drifted too far off — go back and re-aim (hysteresis)
+        if abs(heading_error) > self._rotate_reentry_threshold:
+            self._stop()
+            self._state = State.ROTATE_TO_START
+            self.get_logger().info(
+                f'Drifted off heading ({math.degrees(heading_error):.1f}°), re-aiming...'
+            )
+            return
+        
+        linear = self._drive_to_start_speed
+        angular = self._drive_heading_kp * heading_error
+        angular = max(-self._controller.cfg.max_angular,
+                    min(self._controller.cfg.max_angular, angular))
         self._publish_cmd(linear, angular)
         
         self.get_logger().info(
-            f'[GO_TO_START] Dist: {distance:.2f}m | Err: {math.degrees(heading_error):.1f}° | Spd: {linear:.2f}',
+            f'[DRIVE_TO_START] Dist: {dist:.2f}m | Err: {math.degrees(heading_error):.1f}° | Spd: {linear:.2f}',
             throttle_duration_sec=0.5
         )
+
+    def _normalize_angle(self, angle: float) -> float:
+        while angle > math.pi:
+            angle -= 2 * math.pi
+        while angle < -math.pi:
+            angle += 2 * math.pi
+        return angle
 
     def _handle_align_at_start(self):
         """Align heading at start."""
@@ -233,17 +303,17 @@ class TrajectoryFollowerNode(Node):
         # Advance past waypoints we've passed
         
         
-        # Get lookahead waypoint within segment
-        la_idx, la_wp = self._trajectory.find_lookahead_in_segment(
-            self._x, self._y,
-            num_points_ahead=10
-        )
-        
-        # Distance to lookahead
-        dist_to_la = math.sqrt((la_wp.x - self._x)**2 + (la_wp.y - self._y)**2)
-        
+        # Re-add the waypoint counter advance (cosmetic — keeps WP index live in logs)
+        self._trajectory.advance_waypoint(self._x, self._y, tolerance=0.12)
+
         # Is this segment reverse?
         is_reverse = seg.is_reverse
+
+        # Distance-based lookahead — picks a waypoint ~lookahead meters ahead on path
+        la_dist = self._lookahead_reverse if is_reverse else self._lookahead_forward
+        la_idx, la_wp = self._trajectory.find_lookahead_by_distance(
+            self._x, self._y, la_dist
+        )
         
         # Obstacle check (only for forward)
         if not is_reverse and self._front_dist < self._stop_distance:

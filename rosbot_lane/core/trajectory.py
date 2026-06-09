@@ -261,7 +261,29 @@ class Trajectory:
         lookahead_idx = min(closest_idx + num_points_ahead, seg.end_idx)
     
         return lookahead_idx, self.waypoints[lookahead_idx]
-    
+
+    def find_lookahead_by_distance(self, x: float, y: float, lookahead_distance: float) -> Tuple[int, Waypoint]:
+        """
+        Find the waypoint that is approximately `lookahead_distance` meters
+        ahead along the recorded path, starting from the waypoint closest to (x, y).
+        """
+        seg = self.current_segment
+        if not seg:
+            return 0, self.waypoints[0]
+        
+        closest_idx = self.find_closest_waypoint(x, y)
+        
+        cumulative = 0.0
+        for i in range(closest_idx, seg.end_idx):
+            wp_curr = self.waypoints[i]
+            wp_next = self.waypoints[i + 1]
+            cumulative += wp_curr.distance_to(wp_next.x, wp_next.y)
+            if cumulative >= lookahead_distance:
+                return i + 1, self.waypoints[i + 1]
+        
+        # Hit the segment end before reaching the lookahead distance
+        return seg.end_idx, self.waypoints[seg.end_idx]
+
     def get_waypoint(self, idx: int) -> Optional[Waypoint]:
         """Get waypoint by index."""
         if 0 <= idx < len(self.waypoints):
