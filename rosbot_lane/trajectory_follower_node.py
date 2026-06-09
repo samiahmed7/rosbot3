@@ -35,6 +35,7 @@ class State(Enum):
     FOLLOWING_SEGMENT = 4
     SEGMENT_TRANSITION = 5
     ALIGN_AT_END = 6
+    OVERTAKING = 7
     COMPLETE = 7
 
 
@@ -68,10 +69,33 @@ class TrajectoryFollowerNode(Node):
         # Segment-following lookahead distances (arc length along path)
         self._lookahead_forward = 0.35   # m
         self._lookahead_reverse = 0.20   # m — tighter for reverse for better tracking
+
+        # Lane corridor for obstacle detection (forward only)
+        self._lane_width = 0.50            # m — robot footprint + small margin
+        self._lane_max_lookahead = 2.0     # m — only flag obstacles within this forward distance
+
+        # Overtaking (left side, German convention)
+        self._overtake_trigger_time = 1.5        # s — must be in slow mode this long before triggering
+        self._overtake_lateral_offset = 0.5      # m — how far left of the recorded path to swerve
+        self._overtake_check_forward = 2.0       # m — verify left lane clear at least this far ahead
+        self._overtake_phase_duration = 1.5      # s — OUT and IN ramp durations
+        self._overtake_pass_distance = 1.0       # m — distance to travel in PASS before merging back
+        self._overtake_pass_timeout = 8.0        # s — safety cap on PASS phase
+
+        # Overtake state
+        self._slowdown_timer = 0.0               # accumulated time in slow mode
+        self._overtake_phase = None              # 'OUT' | 'PASS' | 'IN'
+        self._overtake_phase_start_time = None
+        self._overtake_pass_start_pos = None     # (x, y) at start of PASS
+        self._latest_scan = None                 # stored for feasibility checks
         
         # LIDAR config (LIDAR is backwards - front at ±π)
         self._front_angle_range = math.radians(30)
-        self._stop_distance = 0.35
+        # Obstacle avoidance — stop-and-wait (forward only)
+        self._obstacle_stop_distance = 0.35    # m — hard stop below this
+        self._obstacle_slow_distance = 0.60    # m — start decelerating below this
+        self._obstacle_clear_distance = 0.50   # m — resume only when clearer than this (hysteresis)
+        self._obstacle_paused = False           # state: currently waiting?
         
         # =====================
         
@@ -116,22 +140,81 @@ class TrajectoryFollowerNode(Node):
         self.get_logger().info('Trajectory follower ready.')
 
     def _scan_cb(self, msg: LaserScan):
-        """Process LIDAR scan - extract front distance."""
-        front_dists = []
-        
+        """Cache the scan and update front-lane distance."""
+        self._latest_scan = msg
+        self._front_dist = self._closest_in_region(
+            msg,
+            x_min=0.0, x_max=self._lane_max_lookahead,
+            y_min=-self._lane_width / 2.0, y_max=self._lane_width / 2.0,
+        )
+
+    def _closest_in_region(self, msg: LaserScan, x_min: float, x_max: float,
+                        y_min: float, y_max: float) -> float:
+        """Find the closest forward distance to any LIDAR point inside a rectangle
+        in the robot frame. Returns inf if region is empty."""
+        closest = float('inf')
         for i, dist in enumerate(msg.ranges):
             if dist < msg.range_min or dist > msg.range_max:
                 continue
             if math.isnan(dist) or math.isinf(dist):
                 continue
-            
             angle = msg.angle_min + i * msg.angle_increment
-            
-            # LIDAR backwards - front at ±π
-            if abs(abs(angle) - math.pi) <= self._front_angle_range:
-                front_dists.append(dist)
+            x = -dist * math.cos(angle)   # +x = forward
+            y = -dist * math.sin(angle)   # +y = left
+            if x_min < x < x_max and y_min < y < y_max:
+                if x < closest:
+                    closest = x
+        return closest
+
+    def _check_obstacle(self) -> tuple:
+        """
+        Returns (speed_scale, should_stop).
+        speed_scale: multiply normal speed by this (0..1) for smooth deceleration
+        should_stop: True if currently halted waiting for obstacle to clear
+        """
+        dist = self._front_dist
         
-        self._front_dist = min(front_dists) if front_dists else float('inf')
+        # Currently waiting — only resume when comfortably clear (hysteresis)
+        if self._obstacle_paused:
+            if dist > self._obstacle_clear_distance:
+                self._obstacle_paused = False
+                self.get_logger().info(f'Path clear (dist={dist:.2f}m) — resuming')
+                return 1.0, False
+            return 0.0, True
+        
+        # Currently moving — trigger pause if too close
+        if dist < self._obstacle_stop_distance:
+            self._obstacle_paused = True
+            self.get_logger().info(f'Obstacle at {dist:.2f}m — pausing until clear')
+            return 0.0, True
+        
+        # In the slow-down zone — linear ramp
+        if dist < self._obstacle_slow_distance:
+            band = self._obstacle_slow_distance - self._obstacle_stop_distance
+            scale = (dist - self._obstacle_stop_distance) / band
+            return scale, False
+    
+        # Fully clear
+        return 1.0, False
+    
+    def _is_overtake_feasible(self) -> bool:
+        """Is the left lane (overtake corridor) clear of LIDAR points?"""
+        if self._latest_scan is None:
+            return False
+        
+        half_lane = self._lane_width / 2.0
+        offset = self._overtake_lateral_offset
+        
+        # Check the overtake lane: shifted left by `offset`, full lane width.
+        # Forward extent: from slightly behind the robot to overtake_check_forward.
+        closest = self._closest_in_region(
+            self._latest_scan,
+            x_min=-0.2,
+            x_max=self._overtake_check_forward,
+            y_min=offset - half_lane,
+            y_max=offset + half_lane,
+        )
+        return closest == float('inf')
 
     def _update_pose(self) -> bool:
         """Get current pose from TF."""
@@ -177,6 +260,8 @@ class TrajectoryFollowerNode(Node):
             self._handle_segment_transition()
         elif self._state == State.ALIGN_AT_END:
             self._handle_align_at_end()
+        elif self._state == State.OVERTAKING:
+            self._handle_overtaking()
 
     def _handle_rotate_to_start(self):
         """Phase 1: rotate in place until facing the start point."""
@@ -315,18 +400,21 @@ class TrajectoryFollowerNode(Node):
             self._x, self._y, la_dist
         )
         
-        # Obstacle check (only for forward)
-        if not is_reverse and self._front_dist < self._stop_distance:
-            self._stop()
-            self.get_logger().info(f'[STOP] Obstacle at {self._front_dist:.2f}m', throttle_duration_sec=0.5)
-            return
+        # Obstacle check (forward only — reverse skipped per design)
+        if not is_reverse:
+            obstacle_scale, should_stop = self._check_obstacle()
+            if should_stop:
+                self._stop()
+                return
+        else:
+            obstacle_scale = 1.0
         
         # Compute control
         linear, angular, distance, heading_error, _ = self._controller.compute_control(
             self._x, self._y, self._theta,
             la_wp.x, la_wp.y,
             is_reverse=is_reverse,
-            speed_factor=1.0
+            speed_factor=obstacle_scale
         )
         
         self._publish_cmd(linear, angular)
