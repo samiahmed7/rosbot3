@@ -296,3 +296,15 @@ class Trajectory:
         while angle < -math.pi:
             angle += 2 * math.pi
         return angle
+    
+    def tangent_at(self, idx: int) -> float:
+        """Path tangent angle (radians) at waypoint `idx`."""
+        if idx < 0:
+            idx = 0
+        if idx >= len(self.waypoints) - 1:
+            idx = len(self.waypoints) - 2
+        if idx < 0:
+            return 0.0
+        dx = self.waypoints[idx + 1].x - self.waypoints[idx].x
+        dy = self.waypoints[idx + 1].y - self.waypoints[idx].y
+        return math.atan2(dy, dx)

@@ -82,9 +82,20 @@ class TrajectoryFollowerNode(Node):
         self._overtake_pass_distance = 1.0       # m — distance to travel in PASS before merging back
         self._overtake_pass_timeout = 8.0        # s — safety cap on PASS phase
 
+        # Overtake: detour-list approach
+        self._overtake_rejoin_distance = 2.0    # m — how far along recorded path the detour rejoins
+        self._overtake_lateral_offset = 0.5     # m — peak lateral offset of the bump
+        self._overtake_num_points = 20          # detour resolution
+        self._overtake_finish_tolerance = 0.15  # m — "reached rejoin point E"
+
+        # Active detour (empty when not overtaking)
+        self._overtake_path = []                # list of (x, y) tuples
+
         # Overtake state
         self._slowdown_timer = 0.0               # accumulated time in slow mode
         self._overtake_phase = None              # 'OUT' | 'PASS' | 'IN'
+        self._overtake_start_x = None
+        self._overtake_start_y = None
         self._overtake_phase_start_time = None
         self._overtake_pass_start_pos = None     # (x, y) at start of PASS
         self._latest_scan = None                 # stored for feasibility checks
@@ -215,6 +226,62 @@ class TrajectoryFollowerNode(Node):
             y_max=offset + half_lane,
         )
         return closest == float('inf')
+    
+    def _generate_detour(self, sx: float, sy: float, ex: float, ey: float) -> list:
+        """Generate a sine-bump detour from (sx, sy) to (ex, ey), bowing left."""
+        dx, dy = ex - sx, ey - sy
+        length = math.hypot(dx, dy)
+        if length < 0.01:
+            return [(sx, sy), (ex, ey)]
+        
+        fx, fy = dx / length, dy / length    # unit along straight line
+        px, py = -fy, fx                     # perpendicular, left
+        
+        waypoints = []
+        n = self._overtake_num_points
+        for i in range(n + 1):
+            t = i / n
+            cx = sx + t * dx
+            cy = sy + t * dy
+            off = self._overtake_lateral_offset * math.sin(math.pi * t)
+            waypoints.append((cx + off * px, cy + off * py))
+        return waypoints
+
+
+    def _find_rejoin_idx(self, distance: float):
+        """Find a waypoint index ~`distance` further along the current segment.
+        Returns None if there isn't enough path left."""
+        seg = self._trajectory.current_segment
+        if not seg:
+            return None
+        
+        closest = self._trajectory.find_closest_waypoint(self._x, self._y)
+        cumulative = 0.0
+        for i in range(closest, seg.end_idx):
+            wp_a = self._trajectory.waypoints[i]
+            wp_b = self._trajectory.waypoints[i + 1]
+            cumulative += wp_a.distance_to(wp_b.x, wp_b.y)
+            if cumulative >= distance:
+                return i + 1
+        return None   # ran out of segment before reaching target distance
+
+
+    def _lookahead_on_detour(self, distance: float):
+        """Walk the detour from the closest point, return target ~distance ahead."""
+        min_d, closest_idx = float('inf'), 0
+        for i, (wx, wy) in enumerate(self._overtake_path):
+            d = math.hypot(wx - self._x, wy - self._y)
+            if d < min_d:
+                min_d, closest_idx = d, i
+        
+        cumulative = 0.0
+        for i in range(closest_idx, len(self._overtake_path) - 1):
+            wx1, wy1 = self._overtake_path[i]
+            wx2, wy2 = self._overtake_path[i + 1]
+            cumulative += math.hypot(wx2 - wx1, wy2 - wy1)
+            if cumulative >= distance:
+                return self._overtake_path[i + 1]
+        return self._overtake_path[-1]
 
     def _update_pose(self) -> bool:
         """Get current pose from TF."""
@@ -409,6 +476,39 @@ class TrajectoryFollowerNode(Node):
         else:
             obstacle_scale = 1.0
         
+        # Track time in slow mode for overtake trigger
+        dt = 0.05  # control loop period
+        if obstacle_scale < 1.0:
+            self._slowdown_timer += dt
+        else:
+            self._slowdown_timer = 0.0
+
+        # If we've been slowed for long enough AND the left lane is clear, overtake
+        if (self._slowdown_timer >= self._overtake_trigger_time
+                and not is_reverse
+                and self._is_overtake_feasible()):
+            
+            rejoin_idx = self._find_rejoin_idx(self._overtake_rejoin_distance)
+            if rejoin_idx is None:
+                # Not enough recorded path ahead — keep doing what we're doing (slow/stop)
+                self.get_logger().info(
+                    'Overtake desired but not enough path ahead — staying paused',
+                    throttle_duration_sec=2.0
+                )
+                # don't fall through to overtake; just continue current behavior
+            else:
+                rejoin_wp = self._trajectory.waypoints[rejoin_idx]
+                self._overtake_path = self._generate_detour(
+                    self._x, self._y, rejoin_wp.x, rejoin_wp.y
+                )
+                self.get_logger().info(
+                    f'Overtake: detour generated, {len(self._overtake_path)} pts, '
+                    f'rejoin at WP {rejoin_idx}'
+                )
+                self._state = State.OVERTAKING
+                self._slowdown_timer = 0.0
+                return
+        
         # Compute control
         linear, angular, distance, heading_error, _ = self._controller.compute_control(
             self._x, self._y, self._theta,
@@ -426,6 +526,46 @@ class TrajectoryFollowerNode(Node):
             f'[{mode}] Seg {self._trajectory.current_segment_idx+1}/{self._trajectory.num_segments} | '
             f'WP {self._trajectory.current_wp_idx} → LA:{la_idx} | '
             f'Goal: {goal_dist:.2f}m | Spd: {linear:.2f}',
+            throttle_duration_sec=0.5
+        )
+    
+    def _handle_overtaking(self):
+        """Drive along the pre-computed detour. Exit when we reach its end."""
+        if not self._overtake_path:
+            self._state = State.FOLLOWING_SEGMENT
+            return
+        
+        # Don't overtake during reverse segments
+        seg = self._trajectory.current_segment
+        if not seg or seg.is_reverse:
+            self._overtake_path = []
+            self._state = State.FOLLOWING_SEGMENT
+            return
+        
+        # End-of-detour check
+        end_x, end_y = self._overtake_path[-1]
+        dist_to_end = math.hypot(end_x - self._x, end_y - self._y)
+        if dist_to_end < self._overtake_finish_tolerance:
+            self.get_logger().info(f'Overtake complete (rejoined path)')
+            self._overtake_path = []
+            self._state = State.FOLLOWING_SEGMENT
+            self._slowdown_timer = 0.0
+            return
+        
+        # Drive to lookahead point on the detour
+        la_x, la_y = self._lookahead_on_detour(self._lookahead_forward)
+        
+        linear, angular, _, heading_error, _ = self._controller.compute_control(
+            self._x, self._y, self._theta,
+            la_x, la_y,
+            is_reverse=False,
+            speed_factor=1.0,
+        )
+        self._publish_cmd(linear, angular)
+        
+        self.get_logger().info(
+            f'[OVERTAKE] to_rejoin={dist_to_end:.2f}m '
+            f'err={math.degrees(heading_error):.1f}° spd={linear:.2f}',
             throttle_duration_sec=0.5
         )
 
