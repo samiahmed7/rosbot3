@@ -85,6 +85,7 @@ class TrajectoryFollowerNode(Node):
         # Overtake: detour-list approach
         self._overtake_rejoin_distance = 2.0    # m — how far along recorded path the detour rejoins
         #self._overtake_lateral_offset = 0.5     # m — peak lateral offset of the bump
+        self._overtake_max_curve = math.radians(20.0)  # max heading change allowed to trigger overtake
         self._overtake_num_points = 20          # detour resolution
         self._overtake_finish_tolerance = 0.22  # m — "reached rejoin point E"
 
@@ -497,17 +498,32 @@ class TrajectoryFollowerNode(Node):
                 )
                 # don't fall through to overtake; just continue current behavior
             else:
-                rejoin_wp = self._trajectory.waypoints[rejoin_idx]
-                self._overtake_path = self._generate_detour(
-                    self._x, self._y, rejoin_wp.x, rejoin_wp.y
-                )
-                self.get_logger().info(
-                    f'Overtake: detour generated, {len(self._overtake_path)} pts, '
-                    f'rejoin at WP {rejoin_idx}'
-                )
-                self._state = State.OVERTAKING
-                self._slowdown_timer = 0.0
-                return
+                # --- NEW STRAIGHTNESS CHECK ---
+                curr_idx = self._trajectory.current_wp_idx
+                theta_curr = self._trajectory.tangent_at(curr_idx)
+                theta_rejoin = self._trajectory.tangent_at(rejoin_idx)
+                
+                # How much does the path curve over the overtake window?
+                angle_diff = abs(self._normalize_angle(theta_rejoin - theta_curr))
+                
+                if angle_diff > self._overtake_max_curve:
+                    self.get_logger().info(
+                        f'Overtake blocked: Path is too curved ({math.degrees(angle_diff):.1f}° > 15°)',
+                        throttle_duration_sec=2.0
+                    )
+                else:
+                    # Path is straight enough, execute overtake
+                    rejoin_wp = self._trajectory.waypoints[rejoin_idx]
+                    self._overtake_path = self._generate_detour(
+                        self._x, self._y, rejoin_wp.x, rejoin_wp.y
+                    )
+                    self.get_logger().info(
+                        f'Overtake: detour generated, {len(self._overtake_path)} pts, '
+                        f'rejoin at WP {rejoin_idx}'
+                    )
+                    self._state = State.OVERTAKING
+                    self._slowdown_timer = 0.0
+                    return
         
         # Compute control
         linear, angular, distance, heading_error, _ = self._controller.compute_control(
