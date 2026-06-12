@@ -130,7 +130,7 @@ class TrajectoryFollowerNode(Node):
         self._state = State.WAITING_FOR_LOCALIZATION
 
         # GO_TO_START tuning (three-phase: ROTATE → DRIVE → ALIGN)
-        self._start_pos_tolerance = 0.10          # m — "close enough" to start
+        self._start_pos_tolerance = 0.05          # m — "close enough" to start
         self._rotate_exit_threshold = 0.08        # rad (~5°)  — tight, exits rotate
         self._rotate_reentry_threshold = 0.40     # rad (~23°) — loose, re-enters rotate (hysteresis!)
         self._drive_to_start_speed = 0.12         # m/s — constant forward speed
@@ -428,11 +428,27 @@ class TrajectoryFollowerNode(Node):
         return angle
 
     def _handle_align_at_start(self):
-        """Align heading at start."""
+        """Align heading at start, with a position-creep safety net."""
         start = self._trajectory.start
-        
+
+        # If SLAM shifted between states and position is still off, creep in slowly
+        # before rotating. Avoids rotating in place while displaced from the start.
+        dist = math.hypot(start.x - self._x, start.y - self._y)
+        if dist > self._start_pos_tolerance:
+            angle_to_start = math.atan2(start.y - self._y, start.x - self._x)
+            heading_error = self._normalize_angle(angle_to_start - self._theta)
+            angular = self._controller.cfg.kp_angular * heading_error * 0.5
+            angular = max(-self._controller.cfg.max_angular,
+                          min(self._controller.cfg.max_angular, angular))
+            self._publish_cmd(0.06, angular)   # very slow creep
+            self.get_logger().info(
+                f'[ALIGN_AT_START] Position refine: dist={dist:.3f}m',
+                throttle_duration_sec=0.5
+            )
+            return
+
+        # Position satisfied — align heading
         angular, aligned = self._controller.compute_align_control(self._theta, start.theta)
-        
         if aligned:
             self._stop()
             self._trajectory.reset()
@@ -440,7 +456,7 @@ class TrajectoryFollowerNode(Node):
             seg = self._trajectory.current_segment
             self.get_logger().info(f'Aligned! Starting {seg}')
             return
-        
+
         self._publish_cmd(0.0, angular)
 
     def _handle_following_segment(self):
