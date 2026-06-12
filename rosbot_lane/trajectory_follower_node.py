@@ -18,6 +18,9 @@ from enum import Enum
 
 # Add package path for imports
 import sys
+import threading
+import select
+import time
 import os
 package_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if package_path not in sys.path:
@@ -108,6 +111,11 @@ class TrajectoryFollowerNode(Node):
         self._obstacle_slow_distance = 0.60    # m — start decelerating below this
         self._obstacle_clear_distance = 0.50   # m — resume only when clearer than this (hysteresis)
         self._obstacle_paused = False           # state: currently waiting?
+        # Manual pause (keyboard)
+        self._manual_paused = False
+        self._term_old_settings = None
+        # Segment transition wait
+        self._transition_start_time = None
         
         # =====================
         
@@ -150,6 +158,9 @@ class TrajectoryFollowerNode(Node):
         self.create_timer(0.05, self._control_loop)
         
         self.get_logger().info('Trajectory follower ready.')
+        # Keyboard listener
+        self._keyboard_thread = threading.Thread(target=self._keyboard_listener, daemon=True)
+        self._keyboard_thread.start()
 
     def _scan_cb(self, msg: LaserScan):
         """Cache the scan and update front-lane distance."""
@@ -313,6 +324,11 @@ class TrajectoryFollowerNode(Node):
             self._state = State.ROTATE_TO_START   # ← was State.GO_TO_START
             self.get_logger().info(f'Localized at ({self._x:.2f}, {self._y:.2f}, θ={math.degrees(self._theta):.1f}°)')
             self.get_logger().info(f'Start: ({self._trajectory.start.x:.2f}, {self._trajectory.start.y:.2f})')
+            return
+        
+        # Manual pause gate — halts motion without disturbing state
+        if self._manual_paused and self._state in (State.FOLLOWING_SEGMENT, State.OVERTAKING):
+            self._stop()
             return
         
         # State machine
@@ -590,9 +606,25 @@ class TrajectoryFollowerNode(Node):
         )
 
     def _handle_segment_transition(self):
-        """Brief transition between segments - just continue to next segment."""
-        # Could add alignment here if needed
-        # For now, just immediately continue
+        """Wait 20 s between segments, then proceed to the next one."""
+        if self._transition_start_time is None:
+            self._transition_start_time = time.time()
+            seg = self._trajectory.current_segment
+            self.get_logger().info(
+                f'Segment transition — waiting 20 s before starting {seg}'
+            )
+            return
+
+        remaining = 20.0 - (time.time() - self._transition_start_time)
+        if remaining > 0:
+            self.get_logger().info(
+                f'Next segment in {remaining:.0f}s …',
+                throttle_duration_sec=1.0
+            )
+            return
+
+        # Wait complete
+        self._transition_start_time = None
         self._state = State.FOLLOWING_SEGMENT
         seg = self._trajectory.current_segment
         if seg:
@@ -611,6 +643,39 @@ class TrajectoryFollowerNode(Node):
             return
         
         self._publish_cmd(0.0, angular)
+    
+    def _keyboard_listener(self):
+        """Background thread: S = stop, R = resume."""
+        try:
+            import termios, tty
+            fd = sys.stdin.fileno()
+            self._term_old_settings = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+            print('\n[KB] S = stop  |  R = resume\n', flush=True)
+            while rclpy.ok():
+                if select.select([sys.stdin], [], [], 0.1)[0]:
+                    ch = sys.stdin.read(1).lower()
+                    if ch == 's':
+                        self._manual_paused = True
+                        self.get_logger().info('[MANUAL] STOPPED — press R to resume')
+                    elif ch == 'r':
+                        self._manual_paused = False
+                        self.get_logger().info('[MANUAL] RESUMED')
+                    elif ch in ('q', '\x03'):   # q or Ctrl+C
+                        break
+        except Exception:
+            pass   # stdin not a tty (piped/launched remotely) — silently skip
+
+    def _restore_terminal(self):
+        """Restore terminal settings on shutdown."""
+        if self._term_old_settings is not None:
+            try:
+                import termios
+                termios.tcsetattr(
+                    sys.stdin.fileno(), termios.TCSADRAIN, self._term_old_settings
+                )
+            except Exception:
+                pass
 
     def _publish_cmd(self, linear: float, angular: float):
         twist = TwistStamped()
@@ -632,6 +697,7 @@ def main(args=None):
         node._stop()
         node.get_logger().info('Stopped.')
     finally:
+        node._restore_terminal()
         node.destroy_node()
         rclpy.shutdown()
 
