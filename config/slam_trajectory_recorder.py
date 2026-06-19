@@ -14,7 +14,7 @@ class SlamTrajectoryRecorderNode(Node):
         super().__init__('slam_trajectory_recorder_node')
         
         # Config
-        self._trajectory_file = '/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/config/slam_trajectory_delete.csv'
+        self._trajectory_file = '/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/config/slam_trajectory.csv'
         self._min_record_distance = 0.02  # Record every 2cm
         
         # TF2 listener

@@ -16,7 +16,9 @@ class PurePursuitConfig:
     min_speed: float = 0.03
     curve_speed: float = 0.08
     reverse_speed: float = 0.10  # Slower for reverse
-    
+    curve_blend_threshold: float = 0.5
+    heading_blend: float = 0.3 
+    heading_blend_curve: float = 0.7
     max_angular: float = 1.0
     kp_angular: float = 1.5
     

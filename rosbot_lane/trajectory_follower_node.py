@@ -48,16 +48,16 @@ class TrajectoryFollowerNode(Node):
         super().__init__('trajectory_follower_node')
         
         # ===== PARAMETERS =====
-        trajectory_file = '/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/config/slam_trajectory.csv'
+        trajectory_file = '/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/config/smoothed_trajectory.csv'
         
         # Pure Pursuit config
         pp_config = PurePursuitConfig(
             lookahead_distance=0.3,  # Shorter lookahead for tighter following
             min_lookahead=0.15,
             max_lookahead=0.5,
-            max_speed=0.15,
-            min_speed=0.03,
-            curve_speed=0.08,
+            max_speed=0.25,
+            min_speed=0.10,
+            curve_speed=0.18,
             reverse_speed=0.10,
             max_angular=1.0,
             kp_angular=1.5,
@@ -67,7 +67,7 @@ class TrajectoryFollowerNode(Node):
         )
         
         # Segment transition tolerance
-        self._segment_goal_tolerance = 0.15
+        self._segment_goal_tolerance = 0.04
 
         # Segment-following lookahead distances (arc length along path)
         self._lookahead_forward = 0.25   # m
