@@ -36,7 +36,7 @@ class State(Enum):
     DRIVE_TO_START = 2
     ALIGN_AT_START = 3
     FOLLOWING_SEGMENT = 4
-    SEGMENT_TRANSITION = 5
+    WAYPOINT_PAUSE = 5
     ALIGN_AT_END = 6
     OVERTAKING = 7
     COMPLETE = 8
@@ -52,12 +52,12 @@ class TrajectoryFollowerNode(Node):
         
         # Pure Pursuit config
         pp_config = PurePursuitConfig(
-            lookahead_distance=0.3,  # Shorter lookahead for tighter following
-            min_lookahead=0.15,
-            max_lookahead=0.5,
-            max_speed=0.25,
+            lookahead_distance=0.15,  # Shorter lookahead for tighter following
+            min_lookahead=0.10,
+            max_lookahead=0.15,
+            max_speed=0.30,
             min_speed=0.10,
-            curve_speed=0.18,
+            curve_speed=0.12,
             reverse_speed=0.10,
             max_angular=1.0,
             kp_angular=1.5,
@@ -70,25 +70,25 @@ class TrajectoryFollowerNode(Node):
         self._segment_goal_tolerance = 0.04
 
         # Segment-following lookahead distances (arc length along path)
-        self._lookahead_forward = 0.25   # m
+        self._lookahead_forward = 0.20   # m
         self._lookahead_reverse = 0.15   # m — tighter for reverse for better tracking
 
         # Lane corridor for obstacle detection (forward only)
-        self._lane_width = 0.50            # m — robot footprint + small margin
+        self._lane_width = 0.40            # m — robot footprint + small margin
         self._lane_max_lookahead = 2.5     # m — only flag obstacles within this forward distance
 
         # Overtaking (left side, German convention)
         self._overtake_trigger_time = 1.5        # s — must be in slow mode this long before triggering
-        self._overtake_lateral_offset = 0.35      # m — how far left of the recorded path to swerve
+        self._overtake_lateral_offset = 0.30      # m — how far left of the recorded path to swerve
         self._overtake_check_forward = 2.0       # m — verify left lane clear at least this far ahead
         self._overtake_phase_duration = 1.5      # s — OUT and IN ramp durations
         self._overtake_pass_distance = 1.0       # m — distance to travel in PASS before merging back
         self._overtake_pass_timeout = 8.0        # s — safety cap on PASS phase
 
         # Overtake: detour-list approach
-        self._overtake_rejoin_distance = 2.0    # m — how far along recorded path the detour rejoins
+        self._overtake_rejoin_distance = 1.5    # m — how far along recorded path the detour rejoins
         #self._overtake_lateral_offset = 0.5     # m — peak lateral offset of the bump
-        self._overtake_max_curve = math.radians(15.0)  # max heading change allowed to trigger overtake
+        self._overtake_max_curve = math.radians(25.0)  # max heading change allowed to trigger overtake
         self._overtake_num_points = 20          # detour resolution
         self._overtake_finish_tolerance = 0.22  # m — "reached rejoin point E"
 
@@ -107,15 +107,24 @@ class TrajectoryFollowerNode(Node):
         # LIDAR config (LIDAR is backwards - front at ±π)
         self._front_angle_range = math.radians(30)
         # Obstacle avoidance — stop-and-wait (forward only)
-        self._obstacle_stop_distance = 0.35    # m — hard stop below this
-        self._obstacle_slow_distance = 0.60    # m — start decelerating below this
+        self._obstacle_stop_distance = 0.40    # m — hard stop below this
+        self._obstacle_slow_distance = 0.90    # m — start decelerating below this
         self._obstacle_clear_distance = 0.50   # m — resume only when clearer than this (hysteresis)
         self._obstacle_paused = False           # state: currently waiting?
         # Manual pause (keyboard)
         self._manual_paused = False
         self._term_old_settings = None
-        # Segment transition wait
-        self._transition_start_time = None
+        # Waypoint pause — stop and wait at specific recorded coordinates
+        self._pause_points = [
+            #(-3.116, 0.548)
+            (6.384, -2.526),
+            (-8.102, -7.342),
+        ]
+        self._pause_tolerance = 0.15      # m — "reached/crossed" this point
+        self._pause_duration = 5.0       # s — how long to wait there
+        self._pause_triggered = set()     # indices already used, so each point fires once
+        self._pause_start_time = None
+        self._pause_active_idx = None
         
         # =====================
         
@@ -132,9 +141,9 @@ class TrajectoryFollowerNode(Node):
         # GO_TO_START tuning (three-phase: ROTATE → DRIVE → ALIGN)
         self._start_pos_tolerance = 0.05          # m — "close enough" to start
         self._rotate_exit_threshold = 0.08        # rad (~5°)  — tight, exits rotate
-        self._rotate_reentry_threshold = 0.40     # rad (~23°) — loose, re-enters rotate (hysteresis!)
+        self._rotate_reentry_threshold = 0.20     # rad (~23°) — loose, re-enters rotate (hysteresis!)
         self._drive_to_start_speed = 0.12         # m/s — constant forward speed
-        self._drive_heading_kp = 0.8              # gentle correction while driving
+        self._drive_heading_kp = 0.10             # gentle correction while driving
         
         # Pose
         self._x = 0.0
@@ -340,8 +349,8 @@ class TrajectoryFollowerNode(Node):
             self._handle_align_at_start()
         elif self._state == State.FOLLOWING_SEGMENT:
             self._handle_following_segment()
-        elif self._state == State.SEGMENT_TRANSITION:
-            self._handle_segment_transition()
+        elif self._state == State.WAYPOINT_PAUSE:
+            self._handle_waypoint_pause()
         elif self._state == State.ALIGN_AT_END:
             self._handle_align_at_end()
         elif self._state == State.OVERTAKING:
@@ -468,21 +477,33 @@ class TrajectoryFollowerNode(Node):
             self._state = State.ALIGN_AT_END
             self.get_logger().info('No more segments!')
             return
-        
+
+        # Check pause points — stop and wait if we've reached/crossed a listed coordinate
+        for idx, (px, py) in enumerate(self._pause_points):
+            if idx in self._pause_triggered:
+                continue
+            if math.hypot(px - self._x, py - self._y) < self._pause_tolerance:
+                self._pause_triggered.add(idx)
+                self._pause_active_idx = idx
+                self._stop()
+                self._state = State.WAYPOINT_PAUSE
+                self.get_logger().info(
+                    f'Reached pause point {idx} ({px:.2f}, {py:.2f}) — waiting {self._pause_duration:.0f}s'
+                )
+                return
+
         # Check if we reached the segment goal
         if self._trajectory.reached_segment_goal(self._x, self._y, self._segment_goal_tolerance):
             self._stop()
-            
-            # Move to next segment
             self._trajectory.advance_segment()
-            
+
             if self._trajectory.is_complete:
                 self._state = State.ALIGN_AT_END
                 self.get_logger().info('All segments complete!')
             else:
-                self._state = State.SEGMENT_TRANSITION
+                self._state = State.FOLLOWING_SEGMENT   # was State.SEGMENT_TRANSITION — no wait now
                 new_seg = self._trajectory.current_segment
-                self.get_logger().info(f'Reached goal! Transitioning to {new_seg}')
+                self.get_logger().info(f'Reached goal! Continuing to {new_seg} (no wait)')
             return
         
         # Advance past waypoints we've passed
@@ -621,30 +642,24 @@ class TrajectoryFollowerNode(Node):
             throttle_duration_sec=0.5
         )
 
-    def _handle_segment_transition(self):
-        """Wait 20 s between segments, then proceed to the next one."""
-        if self._transition_start_time is None:
-            self._transition_start_time = time.time()
-            seg = self._trajectory.current_segment
+    def _handle_waypoint_pause(self):
+        """Wait at a recorded pause-point coordinate, then resume following."""
+        if self._pause_start_time is None:
+            self._pause_start_time = time.time()
             self.get_logger().info(
-                f'Segment transition — waiting 20 s before starting {seg}'
+                f'Pause point {self._pause_active_idx} — waiting {self._pause_duration:.0f}s'
             )
             return
 
-        remaining = 20.0 - (time.time() - self._transition_start_time)
+        remaining = self._pause_duration - (time.time() - self._pause_start_time)
         if remaining > 0:
-            self.get_logger().info(
-                f'Next segment in {remaining:.0f}s …',
-                throttle_duration_sec=1.0
-            )
+            self.get_logger().info(f'Resuming in {remaining:.0f}s …', throttle_duration_sec=1.0)
             return
 
-        # Wait complete
-        self._transition_start_time = None
+        self._pause_start_time = None
+        self._pause_active_idx = None
         self._state = State.FOLLOWING_SEGMENT
-        seg = self._trajectory.current_segment
-        if seg:
-            self.get_logger().info(f'Starting {seg}')
+        self.get_logger().info('Resuming trajectory following')
 
     def _handle_align_at_end(self):
         """Align heading at end."""
