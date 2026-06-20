@@ -23,7 +23,7 @@ class PurePursuitConfig:
     kp_angular: float = 1.5
     
     # Rotate first threshold (forward only)
-    rotate_first_threshold: float = 0.3  # ~17 degrees
+    rotate_first_threshold: float = 0.1
     
     goal_tolerance: float = 0.01
     angle_tolerance: float = 0.05

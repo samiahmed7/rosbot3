@@ -61,7 +61,7 @@ class TrajectoryFollowerNode(Node):
             reverse_speed=0.10,
             max_angular=1.0,
             kp_angular=1.5,
-            rotate_first_threshold=0.3,
+            rotate_first_threshold=0.1,
             goal_tolerance=0.01,
             angle_tolerance=0.05,
         )
@@ -70,7 +70,7 @@ class TrajectoryFollowerNode(Node):
         self._segment_goal_tolerance = 0.04
 
         # Segment-following lookahead distances (arc length along path)
-        self._lookahead_forward = 0.20   # m
+        self._lookahead_forward = 0.30   # m
         self._lookahead_reverse = 0.15   # m — tighter for reverse for better tracking
 
         # Lane corridor for obstacle detection (forward only)
@@ -88,7 +88,7 @@ class TrajectoryFollowerNode(Node):
         # Overtake: detour-list approach
         self._overtake_rejoin_distance = 1.5    # m — how far along recorded path the detour rejoins
         #self._overtake_lateral_offset = 0.5     # m — peak lateral offset of the bump
-        self._overtake_max_curve = math.radians(25.0)  # max heading change allowed to trigger overtake
+        self._overtake_max_curve = math.radians(20.0)  # max heading change allowed to trigger overtake
         self._overtake_num_points = 20          # detour resolution
         self._overtake_finish_tolerance = 0.22  # m — "reached rejoin point E"
 
