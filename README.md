@@ -1,93 +1,93 @@
-# Opta2
+# ROSBot Lane
 
+> **IMPORTANT:** 
+> **Path Adjustments Required:** The commands and scripts in this package currently use absolute paths (e.g., `/home/sharjeel-ahmad/Documents/...`). Since you are likely cloning this from a Git repository, you **must** update these paths in the commands below and within the Python scripts to match your local workspace directory.
 
+This package provides tools for recording and following a path using a ROSBot.
 
-## Getting started
+## Overview
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+A critical component of this setup is the `tf_relay` node. It maps the current `tf` topics to what AMCL requires:
+- `/tf` -> `/rosbot3/tf`
+- `/tf_static` -> `/rosbot3/tf_static`
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+**Note:** You must run the `tf_relay` node before running AMCL to avoid issues with the `tf` topics.
 
-## Add your files
+**Dependencies:** For the core following functionality to work, you really only need the main follower node (`trajectory_follower_node.py`) and the 2 other core files being used in it (`pure_pursuit.py` and `trajectory.py`).
 
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+## 1. Recording a Path
 
+To start recording a path, open separate terminals and run the following commands:
+
+**Terminal 1: Start TF Relay**
+```bash
+python3 ~/Documents/rosbot_ws/src/rosbot_lane/rosbot_lane/tf_relay.py
 ```
-cd existing_repo
-git remote add origin https://gitlab.tu-ilmenau.de/qayo2953/opta2.git
-git branch -M main
-git push -uf origin main
+
+**Terminal 2: Launch SLAM Toolbox**
+```bash
+ros2 launch slam_toolbox online_async_launch.py \
+  slam_params_file:=/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/config/slam_params.yaml \
+  use_sim_time:=false
 ```
 
-## Integrate with your tools
+**Terminal 3: Start Trajectory Recorder**
+```bash
+python3 ~/Documents/rosbot_ws/src/rosbot_lane/rosbot_lane/temp/slam_trajectory_recorder.py
+```
 
-* [Set up project integrations](https://gitlab.tu-ilmenau.de/qayo2953/opta2/-/settings/integrations)
+**Terminal 4: Teleoperate the Robot**
+Drive the robot along the desired path:
+```bash
+ros2 run teleop_twist_keyboard teleop_twist_keyboard \
+  --ros-args -r cmd_vel:=/rosbot3/cmd_vel -p stamped:=true
+```
 
-## Collaborate with your team
+**Terminal 5: Save the Map**
+After completing the drive on the path, save the maps in a new terminal:
+```bash
+ros2 run nav2_map_server map_saver_cli -f ~/Documents/rosbot_ws/src/rosbot_lane/config/track_map
+ros2 service call /slam_toolbox/serialize_map slam_toolbox/srv/SerializePoseGraph \
+  "{filename: '/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/config/track_map'}"
+```
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+**Terminal 6: Smoothen the Path**
+After completing the recording, you need to run the `smooth.py` script to smoothen the recorded path:
+```bash
+python3 ~/Documents/rosbot_ws/src/rosbot_lane/config/smooth.py
+```
+*(Note: Please ensure the path to `smooth.py` is correct for your setup).*
 
-## Test and Deploy
+## 2. Running the Robot on a Recorded Path
 
-Use the built-in continuous integration in GitLab.
+To run the robot autonomously on the path you just recorded, use the following commands across four terminals:
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+**Terminal 1: Start TF Relay**
+```bash
+python3 ~/Documents/rosbot_ws/src/rosbot_lane/rosbot_lane/tf_relay.py
+```
 
-***
+**Terminal 2: Launch AMCL for Localization**
+```bash
+ros2 launch nav2_bringup localization_launch.py \
+  map:=/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/config/track_map.yaml \
+  params_file:=/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/config/amcl_params.yaml \
+  use_sim_time:=false
+```
 
-# Editing this README
+**Terminal 3: Activate Lifecycle Nodes and Initialize Localization**
+```bash
+# Activate lifecycle nodes
+ros2 lifecycle set /map_server configure
+ros2 lifecycle set /map_server activate
+ros2 lifecycle set /amcl configure
+ros2 lifecycle set /amcl activate
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+# Global localization (find robot on map)
+ros2 service call /reinitialize_global_localization std_srvs/srv/Empty
+```
 
-## Suggestions for a good README
-
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+**Terminal 4: Start Trajectory Follower**
+```bash
+python3 ~/Documents/rosbot_ws/src/rosbot_lane/rosbot_lane/trajectory_follower_node.py
+```

@@ -1,0 +1,14 @@
+bin/
+build/
+devel/
+install/
+log/
+.catkin_workspace
+*.pyc
+rosbag
+
+/config/trajectories/
+/rosbot_lane/temp/
+/rosbot_lane/temp.txt
+
+
