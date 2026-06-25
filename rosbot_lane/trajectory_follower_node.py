@@ -8,6 +8,7 @@ Handles multiple direction flips:
 - Switches direction and continues to next flip point
 """
 
+from os import path
 import rclpy
 from rclpy.node import Node
 from tf2_ros import Buffer, TransformListener
@@ -15,6 +16,7 @@ from geometry_msgs.msg import TwistStamped
 from sensor_msgs.msg import LaserScan
 import math
 from enum import Enum
+import subprocess
 
 # Add package path for imports
 import sys
@@ -55,7 +57,7 @@ class TrajectoryFollowerNode(Node):
             lookahead_distance=0.15,  # Shorter lookahead for tighter following
             min_lookahead=0.10,
             max_lookahead=0.15,
-            max_speed=0.30,
+            max_speed=0.40,
             min_speed=0.10,
             curve_speed=0.12,
             reverse_speed=0.10,
@@ -79,7 +81,7 @@ class TrajectoryFollowerNode(Node):
 
         # Overtaking (left side, German convention)
         self._overtake_trigger_time = 1.5        # s — must be in slow mode this long before triggering
-        self._overtake_lateral_offset = 0.30      # m — how far left of the recorded path to swerve
+        self._overtake_lateral_offset = 0.33      # m — how far left of the recorded path to swerve
         self._overtake_check_forward = 2.0       # m — verify left lane clear at least this far ahead
         self._overtake_phase_duration = 1.5      # s — OUT and IN ramp durations
         self._overtake_pass_distance = 1.0       # m — distance to travel in PASS before merging back
@@ -88,7 +90,7 @@ class TrajectoryFollowerNode(Node):
         # Overtake: detour-list approach
         self._overtake_rejoin_distance = 1.5    # m — how far along recorded path the detour rejoins
         #self._overtake_lateral_offset = 0.5     # m — peak lateral offset of the bump
-        self._overtake_max_curve = math.radians(20.0)  # max heading change allowed to trigger overtake
+        self._overtake_max_curve = math.radians(23.0)  # max heading change allowed to trigger overtake
         self._overtake_num_points = 20          # detour resolution
         self._overtake_finish_tolerance = 0.22  # m — "reached rejoin point E"
 
@@ -116,12 +118,26 @@ class TrajectoryFollowerNode(Node):
         self._term_old_settings = None
         # Waypoint pause — stop and wait at specific recorded coordinates
         self._pause_points = [
+            # Map 4
+            #(2.185, -7.155),
+            #(13.3198,0.6645),
+            #(14.699, 2.261),
+
+            # Map3
+            (-5.6675,-10.9492),
+            #(3.900, -3.101),
+            (5.241, -1.533),
+
+            # Map 2
+            #(-0.190, -15.378),
+            #(7.515, -1.680),
+
             #(-3.116, 0.548)
-            (6.384, -2.526),
-            (-8.102, -7.342),
+            #(6.384, -2.526),
+            #(-8.102, -7.342),
         ]
         self._pause_tolerance = 0.15      # m — "reached/crossed" this point
-        self._pause_duration = 5.0       # s — how long to wait there
+        self._pause_duration = 20.0       # s — how long to wait there
         self._pause_triggered = set()     # indices already used, so each point fires once
         self._pause_start_time = None
         self._pause_active_idx = None
@@ -139,7 +155,7 @@ class TrajectoryFollowerNode(Node):
         self._state = State.WAITING_FOR_LOCALIZATION
 
         # GO_TO_START tuning (three-phase: ROTATE → DRIVE → ALIGN)
-        self._start_pos_tolerance = 0.05          # m — "close enough" to start
+        self._start_pos_tolerance = 0.10          # m — "close enough" to start
         self._rotate_exit_threshold = 0.08        # rad (~5°)  — tight, exits rotate
         self._rotate_reentry_threshold = 0.20     # rad (~23°) — loose, re-enters rotate (hysteresis!)
         self._drive_to_start_speed = 0.12         # m/s — constant forward speed
@@ -149,6 +165,14 @@ class TrajectoryFollowerNode(Node):
         self._x = 0.0
         self._y = 0.0
         self._theta = 0.0
+
+        # Audio files
+        self._sound_obstacle = '/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/rosbot_lane/core/obstacle.wav'
+        self._pause_sounds = [
+            '/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/rosbot_lane/core/pickup.wav',
+            '/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/rosbot_lane/core/delivery.wav',
+            '/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/rosbot_lane/core/delivery.wav',
+        ]
         
         # LIDAR
         self._front_dist = float('inf')
@@ -197,6 +221,10 @@ class TrajectoryFollowerNode(Node):
                 if x < closest:
                     closest = x
         return closest
+    
+    def _play_sound(self, path: str):
+        """Fire-and-forget playback so it doesn't block the control loop."""
+        threading.Thread(target=lambda: subprocess.run(['aplay', '-q', path]), daemon=True).start()
 
     def _check_obstacle(self) -> tuple:
         """
@@ -217,6 +245,7 @@ class TrajectoryFollowerNode(Node):
         # Currently moving — trigger pause if too close
         if dist < self._obstacle_stop_distance:
             self._obstacle_paused = True
+            self._play_sound(self._sound_obstacle)
             self.get_logger().info(f'Obstacle at {dist:.2f}m — pausing until clear')
             return 0.0, True
         
@@ -355,6 +384,19 @@ class TrajectoryFollowerNode(Node):
             self._handle_align_at_end()
         elif self._state == State.OVERTAKING:
             self._handle_overtaking()
+        elif self._state == State.COMPLETE:
+            self._handle_complete()
+
+    def _handle_complete(self):
+        """Lap finished — reset per-lap state and loop back to the start."""
+        self._stop()
+        self.get_logger().info('=== LAP COMPLETE — restarting ===')
+        self._pause_triggered = set()
+        self._pause_active_idx = None
+        self._pause_start_time = None
+        self._overtake_path = []
+        self._slowdown_timer = 0.0
+        self._state = State.WAITING_FOR_LOCALIZATION
 
     def _handle_rotate_to_start(self):
         """Phase 1: rotate in place until facing the start point."""
@@ -474,7 +516,7 @@ class TrajectoryFollowerNode(Node):
         
         if not seg:
             self._stop()
-            self._state = State.ALIGN_AT_END
+            self._state = State.COMPLETE
             self.get_logger().info('No more segments!')
             return
 
@@ -486,6 +528,7 @@ class TrajectoryFollowerNode(Node):
                 self._pause_triggered.add(idx)
                 self._pause_active_idx = idx
                 self._stop()
+                self._play_sound(self._pause_sounds[idx])
                 self._state = State.WAYPOINT_PAUSE
                 self.get_logger().info(
                     f'Reached pause point {idx} ({px:.2f}, {py:.2f}) — waiting {self._pause_duration:.0f}s'
@@ -498,7 +541,7 @@ class TrajectoryFollowerNode(Node):
             self._trajectory.advance_segment()
 
             if self._trajectory.is_complete:
-                self._state = State.ALIGN_AT_END
+                self._state = State.COMPLETE
                 self.get_logger().info('All segments complete!')
             else:
                 self._state = State.FOLLOWING_SEGMENT   # was State.SEGMENT_TRANSITION — no wait now
@@ -624,7 +667,18 @@ class TrajectoryFollowerNode(Node):
             self._state = State.FOLLOWING_SEGMENT
             self._slowdown_timer = 0.0
             return
-        
+
+        # Obstacle ahead mid-overtake — hold position, keep the detour intact,
+        # resume the SAME path once clear (no re-trigger, no new detour)
+        obstacle_scale, should_stop = self._check_obstacle()
+        if should_stop:
+            self._stop()
+            self.get_logger().info(
+                '[OVERTAKE] Obstacle ahead — holding position',
+                throttle_duration_sec=1.0
+            )
+            return
+
         # Drive to lookahead point on the detour
         la_x, la_y = self._lookahead_on_detour(self._lookahead_forward)
         
@@ -632,7 +686,7 @@ class TrajectoryFollowerNode(Node):
             self._x, self._y, self._theta,
             la_x, la_y,
             is_reverse=False,
-            speed_factor=1.0,
+            speed_factor=obstacle_scale,   # was 1.0 — now ramps down approaching an obstacle too
         )
         self._publish_cmd(linear, angular)
         
