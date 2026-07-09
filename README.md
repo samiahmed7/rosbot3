@@ -19,7 +19,7 @@ combination this repo has actually been run and debugged against:
 | OpenCV (`cv2`) | 4.13.0 |
 | NumPy | 2.3.0 |
 | SciPy | 1.17.1 |
-| pandas | required by `config/smooth.py` — not preinstalled on every machine, check before running |
+| pandas | required by `config/smooth.py` — not part of system Python, see venv note below |
 | Robot firmware | Husarion ROSbot 3, firmware 2.0, [rosbot_ros `jazzy` branch](https://github.com/husarion/rosbot_ros/tree/jazzy) |
 
 > **Note:** firmware 2.0 does **not** publish `/rosbot3/scan_filtered` —
@@ -27,6 +27,18 @@ combination this repo has actually been run and debugged against:
 > (`amcl_params.yaml`, `lane_params.yaml`, `trajectory_follower_node.py`)
 > have been updated accordingly. If you're on an older Husarion image that
 > *does* publish a filtered scan topic, you may want to switch back.
+
+> **Note on `pandas` / `config/smooth.py`:** `rosbot-server` is an
+> externally-managed Python install (PEP 668) with no sudo access on this
+> university machine, so `pandas` can't just be `pip install`ed system-wide.
+> Use a local venv instead (`smooth.py` is a standalone script, no `rclpy`
+> needed, so a plain venv works):
+> ```bash
+> python3 -m venv .venv
+> .venv/bin/pip install pandas numpy scipy
+> .venv/bin/python3 config/smooth.py
+> ```
+> `.venv/` is already in `.gitignore`.
 
 See [structure.md](structure.md) for what every file in this repo does, and
 [guide.md](guide.md) for the full step-by-step recording/smoothing/running

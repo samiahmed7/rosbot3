@@ -12,6 +12,39 @@ output_file = 'config/smoothed_trajectory.csv'
 df = pd.read_csv(input_file)
 waypoints = df.to_dict('records')
 
+# 1b. Despike: drop single-point outliers caused by a one-frame SLAM
+# scan-matching glitch — the recorder briefly records a bad pose, then
+# immediately snaps back onto the real path. Detected as a point whose
+# neighbors are much closer to *each other* directly than either is to the
+# point itself (i.e. going through this point is a detour, not progress).
+def _despike(points, detour_ratio=2.0):
+    if len(points) < 3:
+        return points
+    cleaned = [points[0]]
+    i = 1
+    while i < len(points) - 1:
+        prev, cur, nxt = cleaned[-1], points[i], points[i + 1]
+        d_prev_cur = math.hypot(cur['x'] - prev['x'], cur['y'] - prev['y'])
+        d_cur_next = math.hypot(nxt['x'] - cur['x'], nxt['y'] - cur['y'])
+        d_prev_next = math.hypot(nxt['x'] - prev['x'], nxt['y'] - prev['y'])
+        is_spike = (
+            d_prev_next > 0
+            and (d_prev_cur + d_cur_next) > detour_ratio * d_prev_next
+        )
+        if is_spike:
+            i += 1  # drop this point, don't add it to cleaned
+            continue
+        cleaned.append(cur)
+        i += 1
+    cleaned.append(points[-1])
+    return cleaned
+
+_before = len(waypoints)
+waypoints = _despike(waypoints)
+if len(waypoints) < _before:
+    print(f"Despiked {_before - len(waypoints)} outlier point(s) from raw recording "
+          f"(likely one-frame SLAM pose glitches).")
+
 # 2. Detect flip points (using your exact logic)
 directions = []
 for i in range(len(waypoints) - 1):
@@ -32,6 +65,39 @@ for f in flip_indices:
     segments.append((start, f))
     start = f
 segments.append((start, len(waypoints) - 1))
+
+# 3b. Merge spuriously short segments into their previous neighbor.
+# A single noisy raw point (e.g. a one-frame SLAM scan-matching glitch) can
+# register as a direction reversal followed immediately by a reversal back,
+# producing a tiny segment that isn't a real intentional direction change in
+# the drive. Segments below this length are treated as noise and folded into
+# the preceding segment rather than kept as their own short, unstable
+# pure-pursuit segment.
+MIN_SEGMENT_LENGTH = 0.15  # meters
+
+def _segment_length(start_idx, end_idx):
+    length = 0.0
+    for i in range(start_idx, end_idx):
+        length += math.hypot(
+            waypoints[i + 1]['x'] - waypoints[i]['x'],
+            waypoints[i + 1]['y'] - waypoints[i]['y'],
+        )
+    return length
+
+merged_segments = [segments[0]]
+dropped = 0
+for seg in segments[1:]:
+    if _segment_length(*seg) < MIN_SEGMENT_LENGTH:
+        prev_start, _ = merged_segments[-1]
+        merged_segments[-1] = (prev_start, seg[1])
+        dropped += 1
+    else:
+        merged_segments.append(seg)
+segments = merged_segments
+if dropped:
+    print(f"Merged {dropped} short segment(s) (<{MIN_SEGMENT_LENGTH}m) into "
+          f"their previous neighbor — likely recording/localization noise, "
+          f"not real direction changes.")
 
 # 4. Smooth and Resample each segment
 smoothed_waypoints = []

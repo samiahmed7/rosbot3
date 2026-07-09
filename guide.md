@@ -79,14 +79,22 @@ teleop is stopped):
 
 ```bash
 ros2 run nav2_map_server map_saver_cli -f config/track_map
-ros2 service call /slam_toolbox/serialize_map slam_toolbox/srv/SerializePoseGraph \
-  "{filename: 'config/track_map'}"
+ros2 service call /slam_toolbox/serialize_map slam_toolbox/srv/SerializePoseGraph "{filename: 'config/track_map'}"
 ```
 
 This writes `config/track_map.pgm`, `.yaml`, `.data`, and `.posegraph`. The
 `.posegraph`/`.data` pair lets you resume/extend this exact SLAM session
 later if needed; the `.pgm`/`.yaml` pair is what AMCL localizes against in
 Part 3.
+
+> **Verify it actually wrote both pairs** — don't just trust the command not
+> erroring. If you split the `serialize_map` call across multiple lines with
+> a trailing `\`, a missing closing quote leaves your shell stuck at a `>`
+> continuation prompt *without ever running the command* — no error, no
+> output, it just silently never executes. Check
+> `ls -la config/track_map.data config/track_map.posegraph` and confirm the
+> timestamp matches *now*, not a previous session, before moving on. Keeping
+> the whole call on one line (as above) avoids the trap entirely.
 
 You can now Ctrl+C terminals 2–4. Leave Terminal 1 (`tf_relay`) running if
 you're moving straight on to Part 2 or 3.
@@ -102,8 +110,25 @@ resamples to uniform 5 cm spacing. Output goes to
 `trajectory_follower_node.py` reads.
 
 ```bash
-python3 config/smooth.py
+.venv/bin/python3 config/smooth.py
 ```
+
+`smooth.py` needs `pandas`/`numpy`/`scipy`, which aren't part of the system
+Python here (and this machine is externally-managed, so no sudo/plain
+`pip install` — see the venv setup note in README.md's Environment section
+if `.venv/` doesn't exist yet). It's a standalone script (no `rclpy`), so a
+plain venv with no ROS access is enough — just remember the `.venv/bin/`
+prefix, not plain `python3`.
+
+> **Do not `source .venv/bin/activate` in a terminal you're also using for
+> ROS nodes.** This venv is isolated on purpose (needed to avoid version
+> conflicts) and does *not* include the system `dist-packages` that
+> `rclpy` itself depends on (e.g. `PyYAML`) — activating it and then
+> running `tf_relay.py` / `trajectory_follower_node.py` / any ROS node in
+> that same shell will fail with `ModuleNotFoundError: No module named
+> 'yaml'` or similar. Use `.venv/bin/python3 config/smooth.py` (no
+> activation needed) for this one script, and plain `python3 ...` in a
+> clean (non-activated) shell for everything else in Part 1 and Part 3.
 
 Expected output:
 ```

@@ -11,6 +11,7 @@ rosbag
 __pycache__/
 *.pyc
 *.pyo
+.venv/
 
 # Editor / IDE swap & temp files
 *.swp
