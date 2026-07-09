@@ -1,13 +1,46 @@
 # ROSBot Lane
 
-> **IMPORTANT:** 
-> **Path Adjustments Required:** The commands and scripts in this package currently use absolute paths (e.g., `/home/sharjeel-ahmad/Documents/...`). Since you are likely cloning this from a Git repository, you **must** update these paths in the commands below and within the Python scripts to match your local workspace directory.
+## Environment / Versions
+
+Observed on the current dev machine (`rosbot-server`) — other machines
+(e.g. a laptop dev environment) may differ slightly, but this is the
+combination this repo has actually been run and debugged against:
+
+| Component | Version |
+|---|---|
+| OS | Ubuntu 24.04 (Noble) |
+| ROS 2 distro | Jazzy Jalisco |
+| Python | 3.12.3 |
+| `navigation2` / `nav2-bringup` | 1.3.11 |
+| `slam_toolbox` | 2.8.4 |
+| `cv_bridge` | 4.1.0 |
+| `rmw_fastrtps_cpp` | 8.4.3 |
+| `teleop_twist_keyboard` | 2.4.1 |
+| OpenCV (`cv2`) | 4.13.0 |
+| NumPy | 2.3.0 |
+| SciPy | 1.17.1 |
+| pandas | required by `config/smooth.py` — not preinstalled on every machine, check before running |
+| Robot firmware | Husarion ROSbot 3, firmware 2.0, [rosbot_ros `jazzy` branch](https://github.com/husarion/rosbot_ros/tree/jazzy) |
+
+> **Note:** firmware 2.0 does **not** publish `/rosbot3/scan_filtered` —
+> only raw `/rosbot3/scan`. All scan-topic references in this repo
+> (`amcl_params.yaml`, `lane_params.yaml`, `trajectory_follower_node.py`)
+> have been updated accordingly. If you're on an older Husarion image that
+> *does* publish a filtered scan topic, you may want to switch back.
+
+See [structure.md](structure.md) for what every file in this repo does, and
+[guide.md](guide.md) for the full step-by-step recording/smoothing/running
+walkthrough (with troubleshooting).
+
+> **IMPORTANT:**
+> The commands and scripts in this package now use workspace-relative paths so they work from the repository root without editing them for each machine.
 
 This package provides tools for recording and following a path using a ROSBot.
 
 ## Overview
 
 A critical component of this setup is the `tf_relay` node. It maps the current `tf` topics to what AMCL requires:
+
 - `/tf` -> `/rosbot3/tf`
 - `/tf_static` -> `/rosbot3/tf_static`
 
@@ -20,24 +53,28 @@ A critical component of this setup is the `tf_relay` node. It maps the current `
 To start recording a path, open separate terminals and run the following commands:
 
 **Terminal 1: Start TF Relay**
+
 ```bash
-python3 ~/Documents/rosbot_ws/src/rosbot_lane/rosbot_lane/tf_relay.py
+python3 rosbot_lane/tf_relay.py
 ```
 
 **Terminal 2: Launch SLAM Toolbox**
+
 ```bash
 ros2 launch slam_toolbox online_async_launch.py \
-  slam_params_file:=/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/config/slam_params.yaml \
+  slam_params_file:=config/slam_params.yaml \
   use_sim_time:=false
 ```
 
 **Terminal 3: Start Trajectory Recorder**
+
 ```bash
-python3 ~/Documents/rosbot_ws/src/rosbot_lane/rosbot_lane/temp/slam_trajectory_recorder.py
+python3 config/slam_trajectory_recorder.py
 ```
 
 **Terminal 4: Teleoperate the Robot**
 Drive the robot along the desired path:
+
 ```bash
 ros2 run teleop_twist_keyboard teleop_twist_keyboard \
   --ros-args -r cmd_vel:=/rosbot3/cmd_vel -p stamped:=true
@@ -45,37 +82,43 @@ ros2 run teleop_twist_keyboard teleop_twist_keyboard \
 
 **Terminal 5: Save the Map**
 After completing the drive on the path, save the maps in a new terminal:
+
 ```bash
-ros2 run nav2_map_server map_saver_cli -f ~/Documents/rosbot_ws/src/rosbot_lane/config/track_map
+ros2 run nav2_map_server map_saver_cli -f config/track_map
 ros2 service call /slam_toolbox/serialize_map slam_toolbox/srv/SerializePoseGraph \
-  "{filename: '/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/config/track_map'}"
+  "{filename: 'config/track_map'}"
 ```
 
 **Terminal 6: Smoothen the Path**
 After completing the recording, you need to run the `smooth.py` script to smoothen the recorded path:
+
 ```bash
-python3 ~/Documents/rosbot_ws/src/rosbot_lane/config/smooth.py
+python3 config/smooth.py
 ```
-*(Note: Please ensure the path to `smooth.py` is correct for your setup).*
+
+_(Note: Please ensure the path to `smooth.py` is correct for your setup)._
 
 ## 2. Running the Robot on a Recorded Path
 
 To run the robot autonomously on the path you just recorded, use the following commands across four terminals:
 
 **Terminal 1: Start TF Relay**
+
 ```bash
-python3 ~/Documents/rosbot_ws/src/rosbot_lane/rosbot_lane/tf_relay.py
+python3 rosbot_lane/tf_relay.py
 ```
 
 **Terminal 2: Launch AMCL for Localization**
+
 ```bash
 ros2 launch nav2_bringup localization_launch.py \
-  map:=/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/config/track_map.yaml \
-  params_file:=/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/config/amcl_params.yaml \
+  map:=config/track_map.yaml \
+  params_file:=config/amcl_params.yaml \
   use_sim_time:=false
 ```
 
 **Terminal 3: Activate Lifecycle Nodes and Initialize Localization**
+
 ```bash
 # Activate lifecycle nodes
 ros2 lifecycle set /map_server configure
@@ -88,6 +131,7 @@ ros2 service call /reinitialize_global_localization std_srvs/srv/Empty
 ```
 
 **Terminal 4: Start Trajectory Follower**
+
 ```bash
-python3 ~/Documents/rosbot_ws/src/rosbot_lane/rosbot_lane/trajectory_follower_node.py
+python3 rosbot_lane/trajectory_follower_node.py
 ```

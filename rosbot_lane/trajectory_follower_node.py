@@ -8,7 +8,7 @@ Handles multiple direction flips:
 - Switches direction and continues to next flip point
 """
 
-from os import path
+from pathlib import Path
 import rclpy
 from rclpy.node import Node
 from tf2_ros import Buffer, TransformListener
@@ -44,13 +44,18 @@ class State(Enum):
     COMPLETE = 8
 
 
+WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
+TRAJECTORY_PATH = WORKSPACE_ROOT / 'config' / 'smoothed_trajectory.csv'
+SOUND_DIR = WORKSPACE_ROOT / 'rosbot_lane' / 'core'
+
+
 class TrajectoryFollowerNode(Node):
 
     def __init__(self):
         super().__init__('trajectory_follower_node')
         
         # ===== PARAMETERS =====
-        trajectory_file = '/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/config/smoothed_trajectory.csv'
+        trajectory_file = str(TRAJECTORY_PATH)
         
         # Pure Pursuit config
         pp_config = PurePursuitConfig(
@@ -167,11 +172,11 @@ class TrajectoryFollowerNode(Node):
         self._theta = 0.0
 
         # Audio files
-        self._sound_obstacle = '/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/rosbot_lane/core/obstacle.wav'
+        self._sound_obstacle = str(SOUND_DIR / 'obstacle.wav')
         self._pause_sounds = [
-            '/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/rosbot_lane/core/pickup.wav',
-            '/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/rosbot_lane/core/delivery.wav',
-            '/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/rosbot_lane/core/delivery.wav',
+            str(SOUND_DIR / 'pickup.wav'),
+            str(SOUND_DIR / 'delivery.wav'),
+            str(SOUND_DIR / 'delivery.wav'),
         ]
         
         # LIDAR
@@ -182,7 +187,7 @@ class TrajectoryFollowerNode(Node):
         self._tf_listener = TransformListener(self._tf_buffer, self)
         
         # Subscribers
-        self.create_subscription(LaserScan, '/rosbot3/scan_filtered', self._scan_cb, 10)
+        self.create_subscription(LaserScan, '/rosbot3/scan', self._scan_cb, 10)
         
         # Publisher
         self._cmd_pub = self.create_publisher(TwistStamped, '/rosbot3/cmd_vel', 10)

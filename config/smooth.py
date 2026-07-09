@@ -7,8 +7,8 @@ def normalize_angle(angle):
     return (angle + math.pi) % (2 * math.pi) - math.pi
 
 # 1. Load the raw trajectory
-input_file = 'slam_trajectory.csv'
-output_file = 'smoothed_trajectory.csv'
+input_file = 'config/slam_trajectory.csv'
+output_file = 'config/smoothed_trajectory.csv'
 df = pd.read_csv(input_file)
 waypoints = df.to_dict('records')
 

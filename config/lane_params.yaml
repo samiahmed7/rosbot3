@@ -26,9 +26,9 @@ control:
 
 # Topics
 topics:
-  image: '/rosbot3/oak/rgb/image_raw'
-  cmd_vel: '/rosbot3/cmd_vel'
-  scan: '/rosbot3/scan_filtered'
+  image: "/rosbot3/oak/rgb/image_raw"
+  cmd_vel: "/rosbot3/cmd_vel"
+  scan: "/rosbot3/scan"
 
 # Debug
 debug:
@@ -36,28 +36,28 @@ debug:
 
 # Trajectory following (AMCL-based)
 trajectory:
-  file: '/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/config/trajectories/slam_trajectory.csv'
-  
+  file: "config/slam_trajectory.csv"
+
   # Pure pursuit
   lookahead_distance: 0.5
   min_lookahead: 0.3
   max_lookahead: 1.0
-  
+
   # Speed control
   max_speed: 0.20
   min_speed: 0.05
   curve_speed: 0.10
   curvature_threshold: 0.5
-  
+
   # Tolerances
   goal_tolerance: 0.10
   start_tolerance: 0.15
   angle_tolerance: 0.10
-  
+
   # Control
   kp_angular: 1.5
   max_angular: 1.0
-  
+
   # Reverse detection
   reverse_angle_threshold: 120
 

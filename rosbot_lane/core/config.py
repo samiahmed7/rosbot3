@@ -110,7 +110,7 @@ def load_config(yaml_path: str) -> LaneConfig:
         # Topics
         topic_image=cfg['topics']['image'],
         topic_cmd_vel=cfg['topics']['cmd_vel'],
-        topic_scan=cfg['topics'].get('scan', '/rosbot3/scan_filtered'),
+        topic_scan=cfg['topics'].get('scan', '/rosbot3/scan'),
         
         # Debug
         show_debug=cfg['debug']['show_display'],

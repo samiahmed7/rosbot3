@@ -4,7 +4,7 @@ slam_toolbox:
     odom_frame: odom
     base_frame: base_link
     map_frame: map
-    scan_topic: /rosbot3/scan_filtered
+    scan_topic: /rosbot3/scan
 
     # Mode
     mode: mapping

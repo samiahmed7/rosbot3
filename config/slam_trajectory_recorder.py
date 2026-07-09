@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Record trajectory using SLAM pose (map frame)."""
 
+from pathlib import Path
 import rclpy
 from rclpy.node import Node
 from tf2_ros import Buffer, TransformListener
 import math
 import csv
+
+WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
+TRAJECTORY_PATH = WORKSPACE_ROOT / 'config' / 'slam_trajectory.csv'
 
 
 class SlamTrajectoryRecorderNode(Node):
@@ -14,7 +18,7 @@ class SlamTrajectoryRecorderNode(Node):
         super().__init__('slam_trajectory_recorder_node')
         
         # Config
-        self._trajectory_file = '/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/config/slam_trajectory.csv'
+        self._trajectory_file = str(TRAJECTORY_PATH)
         self._min_record_distance = 0.02  # Record every 2cm
         
         # TF2 listener

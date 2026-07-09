@@ -23,6 +23,7 @@ What you should see now
   Red vertical   = image centre (where robot currently is).
 """
 
+from pathlib import Path
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -103,6 +104,8 @@ SHOW_DEBUG = True
 
 # ═════════════════════════════════════════════════════════════════════════════
 
+WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
+
 
 class StraightLaneNode(Node):
 
@@ -123,7 +126,7 @@ class StraightLaneNode(Node):
         self._mask_rl_line = None
 
         # Open CSV log file — written every frame for post-run analysis
-        self._log_file = open('/home/husarion/lane_log.csv', 'w')
+        self._log_file = open(WORKSPACE_ROOT / 'lane_log.csv', 'w')
         # CSV header: all 4 line points + geometry + controller output
         self._log_file.write(
             'frame,'

@@ -1,8 +1,8 @@
 # launch slam node
-ros2 launch slam_toolbox online_async_launch.py slam_params_file:=/home/husarion/my_slam_params.yaml use_sim_time:=false
+ros2 launch slam_toolbox online_async_launch.py slam_params_file:=config/slam_params.yaml use_sim_time:=false
 # updated
 os2 launch slam_toolbox online_async_launch.py \
-  slam_params_file:=/home/husarion/slam_params.yaml \
+  slam_params_file:=config/slam_params.yaml \
   use_sim_time:=false
 
 # RUn the robot
@@ -32,8 +32,8 @@ python3 ~/Documents/rosbot_ws/src/rosbot_lane/rosbot_lane/tf_relay.py
 
 T2:
 ros2 launch nav2_bringup localization_launch.py \
-  map:=/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/config/track_map.yaml \
-  params_file:=/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/config/amcl_params.yaml \
+  map:=config/track_map.yaml \
+  params_file:=config/amcl_params.yaml \
   use_sim_time:=false
   
 T3:
@@ -61,7 +61,7 @@ recording:
 python3 ~/Documents/rosbot_ws/src/rosbot_lane/rosbot_lane/tf_relay.py
 
 ros2 launch slam_toolbox online_async_launch.py \
-  slam_params_file:=/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/config/slam_params.yaml \
+  slam_params_file:=config/slam_params.yaml \
   use_sim_time:=false
   
 python3 ~/Documents/rosbot_ws/src/rosbot_lane/rosbot_lane/temp/slam_trajectory_recorder.py
@@ -72,4 +72,4 @@ ros2 run teleop_twist_keyboard teleop_twist_keyboard \
 ros2 run nav2_map_server map_saver_cli -f ~/Documents/rosbot_ws/src/rosbot_lane/config/track_map
 
 ros2 service call /slam_toolbox/serialize_map slam_toolbox/srv/SerializePoseGraph \
-  "{filename: '/home/sharjeel-ahmad/Documents/rosbot_ws/src/rosbot_lane/config/track_map'}"
+  "{filename: 'config/track_map'}"
