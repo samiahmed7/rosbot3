@@ -25,8 +25,9 @@ def draw_debug_frame(
     sh: int,
     img_width: int,
     split_fraction: float
-):
-    """Draw both debug windows."""
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Build both debug views. Returns (vis, bottom_row) — does not display
+    or save them; caller decides via cv2.imshow / cv2.imwrite."""
     strip_vis = strip.copy()
 
     # Draw lines and points
@@ -62,9 +63,7 @@ def draw_debug_frame(
     # Second window
     bottom_row = _create_strip_mask_view(strip_vis, binary, img_width, split_fraction)
 
-    cv2.imshow('Lane Node', vis)
-    cv2.imshow('Strip | Mask', bottom_row)
-    cv2.waitKey(1)
+    return vis, bottom_row
 
 
 def _draw_line(img: np.ndarray, line, sh: int, color: Tuple[int, int, int]):

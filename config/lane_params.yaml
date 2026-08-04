@@ -1,7 +1,7 @@
 # Image geometry
 image:
-  width: 768
-  height: 432
+  width: 640
+  height: 400
   strip_top_fraction: 0.72
 
 # White segmentation
@@ -18,7 +18,7 @@ detection:
 
 # Controller (for perception-based lane keeping)
 control:
-  kp: 0.30
+  kp: 1.00
   kd: 0.02
   drive_speed: 0.20
   max_error_to_drive: 0.70
@@ -33,6 +33,9 @@ topics:
 # Debug
 debug:
   show_display: true
+  save_frames: true          # cv2.imwrite debug frames to disk (works headless, no GUI backend needed)
+  save_every_n_frames: 30    # periodic capture cadence, in addition to every no-detection frame
+  save_dir: "debug_frames"
 
 # Trajectory following (AMCL-based)
 trajectory:

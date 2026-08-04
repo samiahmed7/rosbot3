@@ -50,6 +50,8 @@ rosbot3/
     ├── trajectory_follower_node.py
     ├── lane_keeping_node.py
     ├── straight_lane_node.py
+    ├── rosbot_v2v_broadcaster.py
+    ├── rosbot_v2v_gate.py
     └── core/
         ├── __init__.py
         ├── config.py
@@ -129,6 +131,8 @@ Python scripts (not part of the ROS package build — run directly).
 | `trajectory_follower_node.py` | The main "drive the recorded path" node (pipeline 1). A segment-based pure-pursuit controller with a state machine (`WAITING_FOR_LOCALIZATION → ROTATE_TO_START → DRIVE_TO_START → ALIGN_AT_START → FOLLOWING_SEGMENT → ... → COMPLETE`, looping). Reads `config/smoothed_trajectory.csv`, gets pose from `map → base_link` TF, publishes `TwistStamped` to `/rosbot3/cmd_vel`. Also handles: forward obstacle stop/slow (via `/rosbot3/scan`), a scripted left-side overtake maneuver, hardcoded waypoint pause points, and a background-thread keyboard pause toggle. Depends on `core/pure_pursuit.py` and `core/trajectory.py` only. |
 | `lane_keeping_node.py` | Camera-based lane-following node (pipeline 2). Subscribes to `/rosbot3/oak/rgb/image_raw`, segments white lane markings, fits lane lines, computes a steering error, and drives with a PD controller. Config-driven from `config/lane_params.yaml`. Built from the `core/` modules (segmentation, detection, geometry, control, logging, debug) — this is the "clean" composed version. Registered as a `ros2 run rosbot_lane lane_keeping_node` console script. |
 | `straight_lane_node.py` | An alternate, self-contained, single-file version of camera-based lane keeping (v2, Hough-transform line fitting). Does **not** import from `core/` — all detection/control logic is inlined in this one ~650-line file. Registered as `ros2 run rosbot_lane straight_lane_node`. Appears to be an earlier/parallel implementation to `lane_keeping_node.py` rather than something it depends on. |
+| `rosbot_v2v_broadcaster.py` | **Pulled from a teammate's branch** (`6hammad9/qcar2-lane-keeping`, `fix/lidar-curve-corridor`), not authored in this repo. Standalone V2V sender — reads `map→base_link` TF, estimates speed, rolls a prediction forward along `config/smoothed_trajectory.csv` (or falls back to constant-velocity if no path), and broadcasts pose/speed/predicted-trajectory/obstacle-intent as JSON over raw UDP at 10Hz to the QCar 2. Deliberately has zero imports from `rosbot_lane` — copy-and-run on the robot independent of this package. See `V2V_README.md` (teammate's repo) for the full design rationale and deployment steps. |
+| `rosbot_v2v_gate.py` | **Pulled from the same branch.** Standalone V2V receiver — listens for HOLD/PROCEED UDP commands from the QCar 2 and gates `trajectory_follower_node.py`'s velocity output accordingly (via a topic remap: follower publishes to `cmd_vel_raw`, this node relays to the real `cmd_vel` or zeroes it during a hold). Fail-safe: a hold is a TTL-bounded lease, never a latch — link loss auto-resumes passthrough. `trajectory_follower_node.py` itself stays completely unmodified; the follower still plans/detours normally even while held. |
 | `.curved_lane_node.py.kate-swp` | Leftover Kate editor swap file from editing a (now apparently deleted or never-committed) `curved_lane_node.py`. Not part of the build; safe to delete. |
 
 ### `rosbot_lane/core/` — shared library modules
@@ -177,3 +181,144 @@ config/smooth.py                     → config/slam_trajectory.csv → config/s
 
 core/obstacle_tracker.py   (standalone module, currently unused by any node)
 ```
+
+---
+
+## Pipeline Architecture (data/control flow)
+
+Pipeline 1 (map/trajectory following) is actually two separate pipelines
+that share files: **Recording** (build a map + capture a path) and
+**Autonomous Following** (localize against that map + drive the path back).
+They never run at the same time, and — this trips people up — **AMCL is
+only used in the second one.** SLAM (`slam_toolbox`) builds the map live
+during recording; AMCL localizes against the *finished* map during
+following. Two different nodes, two different jobs, never both running
+together.
+
+`tf_relay.py` is the one thing common to both — every TF-dependent node
+downstream (`slam_toolbox`, AMCL, the recorder, the follower) needs the
+robot's namespaced `/rosbot3/tf` republished onto plain `/tf` first.
+
+### Phase 1: Recording (`guide.md` Part 1)
+
+```
+teleop_twist_keyboard ──/rosbot3/cmd_vel──► robot drives
+                                                  │
+robot's own TF (odom→base_link) ──/rosbot3/tf───►│
+                                                  ▼
+                                            tf_relay.py
+                                          (/rosbot3/tf → /tf)
+                                                  │
+                    /rosbot3/scan ────────┐       │
+                                          ▼       ▼
+                                    ┌─────────────────────┐
+                                    │   slam_toolbox       │
+                                    │ (online_async_launch) │
+                                    │  scan-matches live,   │
+                                    │  builds occupancy grid│
+                                    └─────────────────────┘
+                                          │            │
+                                 broadcasts TF:     publishes:
+                                 map → odom          /map (OccupancyGrid)
+                                          │
+                                          ▼
+                              config/slam_trajectory_recorder.py
+                            (polls map→base_link TF @ 20Hz,
+                             logs a point every ≥2cm moved)
+                                          │
+                                          ▼
+                            config/slam_trajectory.csv  (raw path)
+
+  ── after driving, saved separately: ──
+    map_saver_cli            → config/track_map.pgm + .yaml   (occupancy grid snapshot, used by AMCL later)
+    slam_toolbox/serialize_map → config/track_map.data + .posegraph  (full pose-graph, resumable SLAM session)
+```
+
+Then, **offline, no ROS involved**:
+
+```
+config/slam_trajectory.csv
+        │
+        ▼
+  config/smooth.py
+    1. despike single-frame SLAM pose glitches
+    2. detect real direction-reversal segments
+    3. merge any still-short (<0.15m) segment into its neighbor
+    4. B-spline fit + resample each segment to uniform 5cm spacing
+        │
+        ▼
+config/smoothed_trajectory.csv   (the file the follower actually drives)
+```
+
+### Phase 2: Autonomous Following (`guide.md` Part 3)
+
+**This is where AMCL comes in** — it replaces `slam_toolbox` as the thing
+providing the `map → odom` transform, now localizing against the fixed
+`track_map.yaml`/`.pgm` instead of building a new one:
+
+```
+                                        tf_relay.py  (same as recording)
+                                              │
+                        /rosbot3/scan ───┐    │ /rosbot3/tf → /tf
+                                         ▼    ▼
+config/track_map.yaml ──►┌───────────────────────────┐
+                          │  nav2_bringup             │
+                          │  localization_launch.py   │
+                          │  ├─ map_server (loads the  │
+                          │  │   saved .pgm as /map)   │
+                          │  └─ amcl (particle filter, │
+                          │      localizes against /map│
+                          │      using live /scan)     │
+                          └───────────────────────────┘
+                                    │
+                          broadcasts TF: map → odom
+                          publishes: /amcl_pose (+ covariance)
+                                    │
+                    (needs manual lifecycle activate +
+                     /reinitialize_global_localization,
+                     then robot must move to converge —
+                     see guide.md's covariance-check steps)
+                                    │
+                                    ▼
+                    map → base_link now resolvable
+                    (map→odom from AMCL, odom→base_link from
+                     the robot's own EKF, both via tf_relay)
+                                    │
+                                    ▼
+                ┌──────────────────────────────────────┐
+                │      trajectory_follower_node.py       │
+                │                                        │
+                │  core/trajectory.py                    │
+                │   loads config/smoothed_trajectory.csv, │
+                │   re-detects segments                  │
+                │                                        │
+                │  state machine:                        │
+                │   WAITING_FOR_LOCALIZATION              │
+                │    → ROTATE_TO_START → DRIVE_TO_START   │
+                │    → ALIGN_AT_START → FOLLOWING_SEGMENT │
+                │    → (WAYPOINT_PAUSE / OVERTAKING)       │
+                │    → ALIGN_AT_END → COMPLETE (loops)     │
+                │                                        │
+                │  core/pure_pursuit.py ◄── map→base_link │
+                │   PurePursuitController computes         │
+                │   steering toward a lookahead point       │
+                │   on the current segment                 │
+                │                                        │
+                │  /rosbot3/scan ──► obstacle stop/slow/   │
+                │   overtake logic (independent of AMCL —  │
+                │   raw LIDAR only, not map-based)         │
+                └──────────────────────────────────────┘
+                                    │
+                                    ▼
+                          /rosbot3/cmd_vel (TwistStamped)
+                                    │
+                                    ▼
+                              robot drives
+```
+
+**Summary of who does what:**
+- **`slam_toolbox`** — recording only. Builds the map, provides `map→odom` while mapping.
+- **AMCL** — following only. Localizes against the already-built map, provides `map→odom` while driving autonomously.
+- **`smooth.py`** — the only offline, non-ROS step. Turns the raw noisy recording into the clean file the follower trusts.
+- **Pure pursuit (`core/pure_pursuit.py`)** — only inside `trajectory_follower_node.py`, only during Phase 2, only once AMCL has actually converged (`_update_pose()` blocks in `WAITING_FOR_LOCALIZATION` on a failed `map→base_link` TF lookup until then).
+- **`tf_relay.py`** — the one node running unchanged in both phases; without it neither `slam_toolbox` nor AMCL ever see the robot's TF at all.

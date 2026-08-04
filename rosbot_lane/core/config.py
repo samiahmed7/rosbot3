@@ -35,6 +35,9 @@ class LaneConfig:
     
     # Debug
     show_debug: bool
+    save_debug_frames: bool
+    save_debug_every_n: int
+    save_debug_dir: str
     
     # Trajectory - Pure pursuit
     traj_file: str
@@ -114,6 +117,9 @@ def load_config(yaml_path: str) -> LaneConfig:
         
         # Debug
         show_debug=cfg['debug']['show_display'],
+        save_debug_frames=cfg['debug'].get('save_frames', False),
+        save_debug_every_n=cfg['debug'].get('save_every_n_frames', 30),
+        save_debug_dir=cfg['debug'].get('save_dir', 'debug_frames'),
         
         # Trajectory - Pure pursuit
         traj_file=traj.get('file', ''),

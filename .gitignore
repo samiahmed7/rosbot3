@@ -12,6 +12,7 @@ __pycache__/
 *.pyc
 *.pyo
 .venv/
+.venv-gui/
 
 # Editor / IDE swap & temp files
 *.swp
@@ -29,3 +30,5 @@ Thumbs.db
 /config/trajectories/
 /rosbot_lane/temp/
 /rosbot_lane/temp.txt
+/debug_frames/
+/lane_log.csv
