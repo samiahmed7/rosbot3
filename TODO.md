@@ -366,6 +366,20 @@ ros2 topic echo /v2v/alive
 
 ### Open items
 
+- [ ] **Fix ROSbot 3's overtake logic — unreliable, gets stuck.**
+      `rosbot_lane/trajectory_follower_node.py`'s overtake state machine
+      generates a detour when it hits an obstacle but then gets stuck
+      indefinitely in "Obstacle ahead — holding position" instead of
+      completing the maneuver, even after the obstacle (QCar 2, parked)
+      was moved clear. One earlier overtake near the same spot DID
+      succeed, so this is intermittent, not a total break. Unrelated to
+      V2V — this is ROSbot 3's own standalone LiDAR/overtake logic.
+      Investigate: does the detour path get regenerated/re-evaluated
+      while holding, or does it keep retrying the same stale 21-point
+      detour from before the hold started? Also log the actual LiDAR
+      range at the stuck moment vs. whatever corridor/threshold it's
+      being compared against. Full context in the "Staged joint-driving
+      test" section's 2026-08-05 pause note below.
 - [ ] Confirm which named person(s) `6hammad9` corresponds to relative to
       Qais's supervisor guideline (Mr. Afreed / Mr. Sharjeel own
       perception/localization/actuation; unclear if this is one of them
@@ -378,7 +392,19 @@ ros2 topic echo /v2v/alive
       section above and worth reviewing together rather than duplicating.
 - [x] **Bench communication link confirmed** — see "Live cross-machine
       test" below. Full real-hardware validation done 2026-08-04.
-- [ ] **Map-frame alignment between the two robots — real, unresolved.**
+- [x] **RESOLVED 2026-08-05** — landmark data collected, transform
+      computed and written. See "CRITICAL CORRECTION" and
+      "Landmark-transform data collection" sections below for the full
+      story (round 1 was against the wrong QCar 2 workspace; round 2
+      against the correct `~/qcar_v2v_ws` worked, 3.7cm residual).
+- [x] **Map-frame alignment between the two robots — DONE 2026-08-05.**
+      Decision made 2026-08-04: going with the landmark-transform
+      approach, not switching to a shared map. Result:
+      `frame_tx=-4.679956, frame_ty=-3.745196, frame_tyaw=-0.705757`,
+      written to QCar 2's `v2v_params.yaml`, 3.7cm residual — see
+      "Landmark-transform data collection" section above for the full
+      story (round 1 was against the wrong QCar 2 workspace and produced
+      garbage; round 2 against the correct `~/qcar_v2v_ws` worked).
       `v2v_params.yaml`'s `frame_tx/ty/tyaw` (rigid transform between the
       two robots' map frames) defaults to identity, which their own
       README says assumes both robots localize against the *same* map.
@@ -392,6 +418,135 @@ ros2 topic echo /v2v/alive
       meaningful even with both vehicles genuinely driving the real
       track — this is a prerequisite for a real field test, not just for
       today's desk-side bench test.
+    - **Transform convention** (from `v2v_common.py`'s `se2_apply`):
+      maps a ROSbot 3 pose `(x,y,yaw)` into QCar 2's frame via
+      `x' = tx + cos(tyaw)*x - sin(tyaw)*y`,
+      `y' = ty + sin(tyaw)*x + cos(tyaw)*y`, `yaw' = yaw + tyaw`.
+    - **Procedure:** pick 2 distinct, precisely identifiable physical
+      points on the real track. For each: position ROSbot 3 exactly at
+      the point, read its converged `/amcl_pose` (x,y); do the same for
+      QCar 2 at the same physical point, read its own `/amcl_pose`.
+      Solve the 2-point rigid transform (rotation from the angle between
+      the two landmark vectors in each frame, then translation) for
+      `tx/ty/tyaw`, write into `config/v2v_params.yaml` on the QCar 2
+      side (`frame_tx`/`frame_ty`/`frame_tyaw`).
+- [ ] **Staged joint-driving test — decision made 2026-08-04, IN
+      PROGRESS 2026-08-05.**
+      **Step 0 (fix stale v2v_params.yaml paths): DONE.**
+      **Step 1 (both stacks up, stationary, V2V off): DONE.**
+      **Step 2 (V2V link up, both stationary, no motion capability armed):
+      DONE, SUCCESS.** `v2v_receiver` (on `~/qcar_v2v_ws`, correct
+      workspace) + `rosbot_v2v_broadcaster.py` (on ROSbot 3) brought up
+      together. First real end-to-end validation of the calibrated
+      transform: `/v2v/alive=true`, `/v2v/gap=17.07m` (sane, not
+      garbage), **`/v2v/on_path=true`** (ROSbot 3's broadcast position
+      correctly registers as being on QCar 2's route — direct proof the
+      landmark transform is correct), stats clean (6167 rx, 0 parse
+      errors, 0 seq drops, age_s=0.088). Took a long detour debugging a
+      false alarm: `ros2 node list`/`ros2 topic echo <topic>` (no
+      explicit type) returned empty/failed even though everything was
+      actually fine — those tools look up the topic's type via the graph
+      first and give up fast under discovery latency, unlike
+      `tf2_echo`/type-explicit `topic echo <topic> <type>` which don't
+      need that lookup. **Lesson for future sessions:** if
+      `ros2 node list` or bare `ros2 topic echo <topic>` come back empty
+      but you have reason to believe things are actually running, don't
+      assume the graph is broken — retry with an explicit type
+      (`ros2 topic echo <topic> <type_string> --once`) or use `tf2_echo`
+      style tools before concluding there's a real connectivity problem.
+      **Step 3 (ROSbot 3 drives from Landmark 2, QCar 2 parked at
+      Landmark 1, watching `/v2v/gap`/`/v2v/on_path` live): IN
+      PROGRESS 2026-08-05, working as expected.** ROSbot 3's own LiDAR
+      safety stack correctly paused it for an obstacle mid-drive
+      (independent of V2V). `on_path` flipped `false` at that point —
+      investigated via the `v2v_rx_log.csv` raw log (confirmed the
+      step-0 path fix also fixed logging): `lat_offset=-0.451m`, just
+      over the `lane_half_width=0.35m` threshold. **Not a calibration
+      bug** — a transform with 3.7cm landmark residual doesn't produce a
+      45cm error; this is genuine physical divergence between ROSbot 3's
+      recorded route and QCar 2's specific reference lane at that point
+      on the track (expected between two independently-recorded paths).
+      `blocked=true` confirmed to come directly from ROSbot 3's own
+      broadcast packet (its own pause state relayed correctly), not
+      computed by QCar 2. Both fields behaving exactly as designed.
+      **Useful troubleshooting note for future sessions:** the raw
+      `v2v_rx_log.csv` (columns:
+      `t_rx,seq,age_gap_ms,x,y,yaw,v,localized,moving,qcar_idx,rosbot_idx,gap,lat_offset,on_path`)
+      is the fastest way to sanity-check `on_path`/`gap`/`blocked`
+      against real numbers rather than guessing from the boolean topics
+      alone.
+    - **`gap` sign-flip investigated and explained (2026-08-05).** Saw
+      `gap` jump ~38.77m in one 100ms tick (e.g. `19.368 → -19.399`)
+      while `rosbot_idx` ticked forward by exactly 1 and ROSbot 3's raw
+      x/y stayed perfectly continuous — confirmed via `v2v_rx_log.csv`.
+      Root cause: `gap` is signed "shortest way around the loop"; the
+      jump magnitude matches the recorded route's total loop length
+      (38.80m per HANDOFF.md) almost exactly, meaning this happens right
+      when the two vehicles are close to *half a loop length apart* —
+      genuinely ambiguous which direction is shorter, so the sign flips.
+      **Not a calibration/projection bug** — inherent to any signed
+      loop-gap metric, and it's exactly the geometry this test set up
+      (QCar 2 parked at Landmark 1, ROSbot 3 looping the long way from
+      Landmark 2). **Caveat for later, not yet checked:** if QCar 2's
+      MPC/governor ever consumes raw signed `gap` while actually driving
+      (stage 4/5), a flip at the loop's halfway point would look like a
+      sudden ~38m gap change — worth confirming the governor code uses
+      `abs(gap)` or hysteresis around that crossover before trusting it
+      in a real joint-driving pass.
+    - **ROSbot 3's own (V2V-independent) obstacle avoidance encountered
+      QCar 2 itself, parked in its path near Landmark 1.** First
+      encounter: overtake detour succeeded and rejoined normally. Second
+      lap, same spot (`rejoin at WP 461` both times): overtake generated
+      but repeatedly got stuck at 0.39-0.40m unable to complete, holding
+      position 40+ seconds real time — the detour path still passed too
+      close to QCar 2's physical footprint. Resolved by moving QCar 2
+      further clear of ROSbot 3's driving corridor. Good real-world
+      confirmation that ROSbot 3's stock obstacle avoidance treats QCar 2
+      as an ordinary obstacle (expected — its autonomy stack is
+      completely unmodified/standalone per the V2V design), not a V2V
+      bug.
+    - **PAUSED HERE 2026-08-05, resume next session.** V2V link + step 3
+      (one vehicle moving, one parked) both validated working correctly.
+      Steps 4 (QCar 2 drives, ROSbot 3 parked) and 5 (both moving) not
+      yet attempted — don't skip straight to step 5. **Plan: user is
+      doing step 4 next** (QCar 2 drives via `path_mpc`/`lidar_overtake`
+      per RUNBOOK.md's three-terminal sequence, ROSbot 3 stays parked) —
+      confirms QCar 2's own driving is unaffected by V2V being enabled
+      with no real conflict to react to. Still keep in mind the `gap`
+      loop-halfway sign-flip caveat above if the governor logs anything
+      that looks like a sudden ~38m gap jump while QCar 2 is moving.
+      **Separate, not blocking step 4: ROSbot 3's own overtake maneuver
+      (`trajectory_follower_node.py`, unrelated to V2V) is unreliable —
+      tracked as its own item below, fix it whenever, doesn't need to
+      happen before step 4 since ROSbot 3 stays parked for that step.**
+      Confirmed happening again at end of this session —
+      generates a detour but gets stuck holding position indefinitely
+      ("Obstacle ahead — holding position", repeating every ~1s) instead
+      of completing it, even after the QCar 2 obstacle was moved clear
+      once already. Worth digging into
+      `rosbot_lane/trajectory_follower_node.py`'s overtake state machine
+      (detour generation / rejoin logic) directly — first lap's overtake
+      DID succeed near the same spot, so this looks like an intermittent
+      failure mode, not a total break. Check: does the detour path
+      itself get regenerated/re-evaluated while holding, or does it keep
+      retrying the same (now-invalid) 21-point detour from before? Also
+      worth logging exactly what LiDAR range is being read at the stuck
+      moment vs. the corridor/threshold it's compared against.
+      **To resume:** re-verify both localization stacks are still up and
+      converged (don't assume readings are still valid after a time
+      gap — same caution as always), confirm ROSbot 3's `.venv`/
+      `ROS_DOMAIN_ID` and QCar 2's per-terminal sourcing (`cd
+      ~/qcar_v2v_ws`, `ROS_DOMAIN_ID=42`, `ROS_LOCALHOST_ONLY=1`) since
+      neither persists across terminals/reboots, then dig into the
+      overtake bug before attempting steps 4/5.
+      Once frame alignment is in place, running
+      `trajectory_follower_node.py` on ROSbot 3 and QCar 2's own driving
+      stack at the same time is a real step up in physical risk from
+      everything tested so far (all prior tests were stationary/desk-side).
+      Plan: stage it — e.g. one vehicle moving while the other stays
+      parked first, confirm `gap`/`on_path`/the governor behave sanely
+      from that alone, before letting both move autonomously at once.
+      E-stop/manual override should be ready throughout.
 - [x] **`rosbot_v2v_gate.py`'s HOLD/PROCEED path — tested directly on
       real hardware, 2026-08-04.** Gate run on `rosbot-server`, fed a
       synthetic `TwistStamped` (angular.z=0.05 only, no linear motion) on
@@ -412,6 +567,117 @@ ros2 topic echo /v2v/alive
       confirmed the release happened around 2s, well before TTL expiry —
       worth a closer look sometime, doesn't affect the conclusion since
       the real gating behavior was checked directly.
+
+### CRITICAL CORRECTION (2026-08-05): wrong QCar 2 workspace used all session
+
+Discovered by reading `qcar2_side/HANDOFF.md` and `RUNBOOK.md` (dated
+2026-08-02/03) — user confirmed **`~/qcar_v2v_ws` is the actual current
+setup** on the physical QCar 2. Everything QCar-2-side done in this
+session up to this point (the "QCar 2 side pulled locally + bench-tested"
+work, the "Live cross-machine test", and all 4 landmark readings above)
+used the **wrong workspace**: `~/ros2_ws`, `ROS_DOMAIN_ID=1`, AMCL +
+`science_night_slam.launch.py` + `track_map_new.yaml`. The real one:
+
+| | Correct (`~/qcar_v2v_ws`) | Wrong, used all session (`~/ros2_ws`) |
+|---|---|---|
+| `ROS_DOMAIN_ID` | **42** | 1 |
+| Localization | **Cartographer pure-localization**, no `/amcl_pose` topic | AMCL, has `/amcl_pose` |
+| Map | `mapping_output/qcar_real_20260802-014755.yaml` | `track_map_new.yaml` |
+| Bring-up | `ros2 launch qcar2_nodes qcar2_cartographer_launch.py state_filename:=... configuration_basename:=qcar2_2d_localization.lua resolution:=0.05` (RUNBOOK.md §1 Terminal 1) | `science_night_slam.launch.py` |
+| Pose check | **`ros2 run tf2_ros tf2_echo map base_link`** (no `/amcl_pose` exists) | `ros2 topic echo /amcl_pose` |
+
+**Consequences:**
+- The 4 landmark `/amcl_pose` readings above are against the wrong map —
+  **must be redone** using `tf2_echo map base_link` against
+  `~/qcar_v2v_ws`'s Cartographer localization once it's brought up.
+- The V2V bench test / live cross-machine test protocol-level results
+  (packet delivery, fail-safe contract, alive-flag behavior) are still
+  probably valid as UDP-link tests (V2V rides raw UDP, domain-agnostic by
+  design per `V2V_README.md`), but were not exercised against the actual
+  production localization/map — worth re-running once `~/qcar_v2v_ws` is
+  up, not urgent.
+- `enable_v2v`/`v2v_fusion_enable` default `false` in `~/qcar_v2v_ws`'s
+  known-good `path_mpc`/`lidar_overtake` launch params (RUNBOOK.md §1 T2/T3)
+  — V2V receiver code exists there but is disabled by default, consistent
+  with what we built.
+- The earlier ~3.9x landmark-distance-mismatch investigation (map
+  resolution ruled out, AMCL-seeding theory) is likely moot — it was
+  chasing an artifact of using a possibly-stale `track_map_new.yaml`
+  rather than a real transform problem. Don't carry that theory forward;
+  just redo the readings clean against the correct workspace.
+
+### Landmark-transform data collection (started 2026-08-05)
+
+Raw `/amcl_pose` readings for the 2-point rigid transform (see procedure
+above). Recording each as it's collected so nothing gets lost again.
+
+- **QCar 2 @ Landmark 1** (converged, cov x=0.0073 y=0.0022 yaw=0.0055):
+  `x=-3.080313121212298, y=-3.078642304680784`,
+  `orientation.z=0.061260711418388424, w=0.9981217987983796`
+  → yaw = 2*atan2(z, w) ≈ 0.1225 rad
+- **QCar 2 @ Landmark 2** (converged, cov x=0.0017 y=0.0070 yaw=0.0080):
+  `x=-2.858151435455781, y=-2.1164484116334163`,
+  `orientation.z=0.7567008508985412, w=0.6537612884298241`
+  → yaw = 2*atan2(z, w) ≈ 1.716 rad
+- **ROSbot 3 @ Landmark 1** (re-collected 2026-08-05, converged, cov
+  x=0.0040 y=0.0189 yaw=0.0122 — original 2026-08-04 reading's exact
+  x/y/yaw values were lost in a context-compaction gap, so re-collected
+  fresh rather than reused): `x=-0.9781308487815419, y=3.730390478637725`,
+  `orientation.z=-0.7089744073725912, w=0.7052342091040984`
+  → yaw = 2*atan2(z, w) ≈ -1.576 rad
+- **ROSbot 3 @ Landmark 2** (converged, cov x=0.0249 y=0.0042 yaw=0.0188):
+  `x=0.008356154748831, y=-0.003330947331620`,
+  `orientation.z=0.005646527349004966, w=0.9999840582373786`
+  → yaw = 2*atan2(z, w) ≈ 0.0113 rad
+- **Physical landmark identities** (for reference): Landmark 1 = middle of
+  the map entrance. Landmark 2 = near the heater section, 2nd block line.
+- **SUPERSEDED — see "CRITICAL CORRECTION" section above.** The first
+  round of 4 readings (below, struck through in spirit not literally) was
+  collected against the wrong QCar 2 workspace (`~/ros2_ws`/AMCL/
+  `track_map_new.yaml`) and produced a ~3.9x landmark-distance mismatch
+  that was never conclusively explained — moot now, redoing clean against
+  `~/qcar_v2v_ws`/Cartographer instead. Old readings kept above for
+  reference only, not to be used.
+
+#### Round 2 — correct workspace (`~/qcar_v2v_ws`, Cartographer, 2026-08-05)
+
+- **QCar 2 @ Landmark 1** (`tf2_echo map base_link`, stable across
+  multiple ticks, mm-level jitter): `x=-2.927, y=-0.368`, yaw≈-1.510 rad
+  (-86.5°).
+- **ROSbot 3 @ Landmark 1** (same physical spot QCar 2 was just standing
+  on, converged cov x=0.0032 y=0.0253 yaw=0.0158):
+  `x=-0.850646289126626, y=3.6713109290438415`,
+  `orientation.z=-0.6937356453830356, w=0.7202297233001309`
+  → yaw = 2*atan2(z, w) ≈ -1.535 rad
+- **QCar 2 @ Landmark 2** (`tf2_echo map base_link`, stable across
+  multiple ticks): `x=-3.500, y=-1.300`, yaw≈-1.486 rad (-85.2°).
+- **ROSbot 3 @ Landmark 2** (same spot QCar 2 was just at; took 3 tries —
+  first attempt was still essentially at Landmark 1 (~20cm away, rejected),
+  second attempt didn't converge (y var 0.24-0.25, likely a corridor/
+  along-axis ambiguity near this spot), third attempt after driving
+  forward/back converged cleanly: cov x=0.0030 y=0.0285 yaw=0.0196):
+  `x=-0.6935182068190987, y=2.6625484196337523`,
+  `orientation.z=-0.678511926607521, w=0.7345893856103218`
+  → yaw = 2*atan2(z, w) ≈ -1.491 rad
+- **All 4 round-2 readings collected. Transform computed and written —
+  DONE 2026-08-05.**
+  `distance(L1,L2)`: ROSbot 3 frame 1.0209 m vs QCar 2 frame 1.0941 m
+  (ratio 1.07, plausible — footprint/placement tolerance, not a scale
+  bug). Solved via `se2_apply` 2-point rigid transform:
+  **`frame_tx=-4.679956, frame_ty=-3.745196, frame_tyaw=-0.705757`**
+  (rad, ≈-40.4°). Residual when predicting each landmark from the other:
+  **3.7 cm on both L1 and L2** — solid, self-consistent this time.
+  Written into
+  `~/qcar_v2v_ws/src/qcar_science_night_pkg/config/v2v_params.yaml` on
+  QCar 2 (confirmed via `grep frame_t`). That file is a full
+  symlink-install chain (`install → build → src`), so no rebuild needed —
+  editing `src/` was sufficient.
+  **Fixed 2026-08-05:** `trajectory_file`/`log_file`/`path_spacing` in
+  that same file were stale, pointing at `~/ros2_ws` and the old 0.03
+  spacing — updated to `~/qcar_v2v_ws/mapping_output/my_route_loop.npy`,
+  `~/qcar_v2v_ws/v2v_rx_log.csv`, and `0.05` (matching RUNBOOK.md's
+  `path_mpc`/`lidar_overtake` params) so `gap`/`on_path` will actually be
+  meaningful once V2V is enabled.
 
 ### Live cross-machine test — real hardware, both robots powered on (2026-08-04)
 

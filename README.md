@@ -147,3 +147,49 @@ ros2 service call /reinitialize_global_localization std_srvs/srv/Empty
 ```bash
 python3 rosbot_lane/trajectory_follower_node.py
 ```
+
+## 3. V2V Status Dashboard (ROSbot 3 ↔ QCar 2)
+
+`rosbot_lane/v2v_dashboard.py` is a single self-contained script that runs
+on **both** robots (one instance each) and serves a combined web page:
+both robots' camera feeds, live V2V link/safety parameters (gap, on_path,
+blocked, hold state, etc. — decoded from the wire, no console-reading
+needed), and each robot's currently-active ROS nodes. Either instance's
+URL shows the same combined view; the two instances find each other over
+plain HTTP by IP, not ROS/DDS, so it works even though the two robots
+deliberately keep separate ROS graphs (see `rosbot_v2v_broadcaster.py`'s
+docstring for why).
+
+**On ROSbot 3** (run from `rosbot-server`, actual LAN IP `192.168.0.100`
+— **not** `192.168.0.110`, that's a different device):
+
+```bash
+cd ~/rosbot3
+python3 rosbot_lane/v2v_dashboard.py --role rosbot3 --peer-host 192.168.0.53
+```
+
+**On QCar 2** (`~/qcar_v2v_ws`, `ROS_DOMAIN_ID=42`, `ROS_LOCALHOST_ONLY=1`
+sourced first — see the QCar 2 side's own docs for the exact sourcing):
+
+```bash
+cd ~/qcar_v2v_ws
+python3 v2v_dashboard.py --role qcar2 --peer-host 192.168.0.100
+```
+
+Then open **either** `http://192.168.0.100:8090/` or
+`http://192.168.0.53:8090/` from a laptop browser on the lab network —
+both URLs show the same combined dashboard (both cameras, both robots'
+V2V state, both robots' active nodes).
+
+Notes:
+- Both instances must be running for the combined view to fully populate
+  — if one side isn't up yet, that side's camera panel and node list will
+  just be empty/unreachable until it starts (the page doesn't crash,
+  fields show `--`).
+- Port is `8090` by default (`--port` to change; if you change it on one
+  side, pass `--peer-port` on the other so they still find each other).
+- Plain HTTP, no authentication — trusted lab network only, same caveat
+  as `camera_web_view.py`.
+- Camera topics default to `/camera/color_image` (QCar 2) and
+  `/rosbot3/oak/rgb/image_raw` (ROSbot 3); override with `--camera-topic`
+  if either ever changes.
