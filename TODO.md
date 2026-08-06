@@ -505,6 +505,61 @@ ros2 topic echo /v2v/alive
       as an ordinary obstacle (expected — its autonomy stack is
       completely unmodified/standalone per the V2V design), not a V2V
       bug.
+    - **UPDATE 2026-08-06: step 4 attempted, real collision, stop
+      procedure was broken.** User ran step 4 (QCar 2 driving via
+      `path_mpc`/`lidar_overtake` per RUNBOOK.md's old baseline params,
+      ROSbot 3 parked in its path per the placement guidance above).
+      **QCar 2's LiDAR obstacle stop worked for a human but slammed into
+      ROSbot 3** — root-caused to exactly HANDOFF.md §3.1's documented,
+      pre-existing bug: on curved sections `obstacle_ahead` gets
+      discarded entirely, leaving only the narrow ±0.12m emergency
+      corridor as detector (wide enough to reliably catch a person, not
+      a ROSbot slightly off-centre). A fix was written upstream but
+      **verified completely absent from QCar 2's hardware** — checked
+      all 5 relevant files (`path_mpc_node.py`, `lidar_overtake_node.py`,
+      `lidar_sector_analyzer.py`, `overtake_types.py`,
+      `overtake_safety.py`) on `~/qcar_v2v_ws`, zero fix-related code in
+      any of them. Deployment plan given (scp the 5 files from
+      `qcar2_side` + `colcon build --symlink-install --packages-select
+      qcar_science_night_pkg`) — **not yet confirmed done/tested on the
+      car.** Do not run `lidar_overtake` near ROSbot 3 again until this
+      fix is deployed AND validated at low speed / car jacked up per
+      HANDOFF's own suggested order of work.
+      **Separately, `qcar2_side`'s `fix/lidar-curve-corridor` branch has
+      since been pulled forward twice (2026-08-06/07), picking up:**
+      an IDEAM lane-probing/ellipse-barrier/risk-gating implementation
+      (`952198e` — relevant to the "PAPER Implementation" section above,
+      review with teammate before duplicating), a fix making
+      `path_mpc` publish `/path_curvature` **unconditionally**
+      (`22ea120` — directly relevant to the collision, redeploy
+      `path_mpc_node.py` again after this pull), and **critically**:
+      **the documented stop procedure was itself wrong and has been
+      corrected (`a999b47`).**
+      `ros2 topic pub --once /motion_enable std_msgs/msg/Bool
+      "{data: false}"` — the command used throughout this project
+      (including earlier in this very TODO.md and given verbally by the
+      assistant in chat) — **does NOT stop the car.**
+      `lidar_overtake` republishes `/motion_enable` every cycle, so the
+      one-shot publish is overwritten within ~100ms and the car re-arms
+      itself. Verified on the real vehicle 2026-08-06 while someone was
+      walking around it to reposition an obstacle. **The correct
+      software stop is `pkill -x lidar_overtake`** (exact-name match —
+      `pkill -f lidar_overtake` over SSH is unsafe, it can match your
+      own command line and kill the shell running it), after which the
+      MPC halts on `Motion blocked: LiDAR behavior heartbeat is missing
+      or stale`. **The physical E-stop remains the real stop — use it
+      whenever anyone is near the car, don't rely on any software
+      command as the primary safety mechanism.** Also noted:
+      `pgrep -x cartographer_node` never matches (Linux truncates
+      process names to 15 chars) — check the launch log instead.
+      **Before any further QCar 2 motion testing: redeploy all 5 fixed
+      files (now further updated) + re-verify the stop procedure works
+      as documented, before repeating anything like step 4/5.**
+      `v2v_dashboard.py` (new, `rosbot_lane/v2v_dashboard.py`) was built
+      this session too — a combined web dashboard (both cameras, V2V
+      link/safety parameters, active ROS nodes per robot) so console
+      log-reading isn't needed; see README.md's new "V2V Status
+      Dashboard" section for run commands.
     - **PAUSED HERE 2026-08-05, resume next session.** V2V link + step 3
       (one vehicle moving, one parked) both validated working correctly.
       Steps 4 (QCar 2 drives, ROSbot 3 parked) and 5 (both moving) not
@@ -605,6 +660,88 @@ used the **wrong workspace**: `~/ros2_ws`, `ROS_DOMAIN_ID=1`, AMCL +
   chasing an artifact of using a possibly-stale `track_map_new.yaml`
   rather than a real transform problem. Don't carry that theory forward;
   just redo the readings clean against the correct workspace.
+
+### DHOCBF attempt — NOT SHIPPED, second order disproven on hardware (2026-08-06)
+
+Built the paper's linearized DHOCBF (Eq. 18/19/27) into `path_mpc_node.py`
+behind `use_linearized_dhocbf` (**defaults False, so it is inert**). Then
+ran it against real casadi 3.7.2 **on the QCar itself**. Two hard results:
+
+1. **Eq. (19) transcribed literally makes the NLP infeasible — always.**
+   The printed second-order row has `w (gamma_1-1)^(k+1) psi_0(x_0)`, and
+   `(gamma_1-1)^(k+1)` alternates sign, so for even `k+1` it tightens
+   rather than relaxes and needs `w < 0`, which the paper bounds away.
+   Every solve returned `Infeasible_Problem_Detected`, even with the
+   obstacle at the 50 m idle placeholder. Replacing it with the unrolled
+   chain `psi_1(x_{k+1}) >= w (1-gamma_2)^(k+1) psi_1(x_0)` fixes that.
+2. **Even corrected, the second-order family cannot do an overtake.**
+   Stationary ROSbot at 0.80 m, reference offset 0.47 m left (the
+   OVERTAKE_LEFT S-curve's target lane): `Infeasible_Problem_Detected`,
+   unchanged at `max_iter` 300 and 2000 — over-constraint, not iteration
+   budget. With the solver status check active the car would hard-stop
+   through the entire manoeuvre, which is the exact bug being chased.
+   **With `n_second = 0` (first-order linearized only) the same scenario
+   solves cleanly**: `Solve_Succeeded`, ellipse metric 1.93 vs the legacy
+   barrier's 1.53, advancing 0.244 m vs legacy 0.327 m.
+
+So the linearization, the normalization and family 1 are sound; the
+second-order chain needs its own design pass (suspect `gamma_2`, or
+anchoring `psi_1(x_0)` differently). **Not pushed** — as it stands it is
+worse than the teammate's live code on the one scenario that matters.
+46 unit tests pass on the QCar's own Python 3.8.10.
+
+Independently valid and worth landing on their own, whatever happens to
+the barrier: the **IPOPT status check** (`solver.stats()` was never called,
+so on `max_iter`/timeout a violating iterate was silently accepted — the
+"hard" barrier was only hard when the solver happened to converge), the
+**gamma_1 retune** 0.35 -> 0.06 (engagement 4.6 cm -> 26.7 cm via
+`d_engage = v*dt/gamma`), a **`shift()` bug** that spliced the first
+barrier family's tail into the second's head, and a **warm-start vector**
+that sat outside its own bounds. Plus `ideam.ellipse_halfplane_world()`
+with a 2000-case property test proving the supporting-hyperplane
+soundness claim.
+
+### LiDAR curve-corridor fix — ALREADY DEPLOYED (verified 2026-08-06)
+
+Went to deploy it and found the car already ahead of git. Verified over SSH
+against `~/qcar_v2v_ws`:
+
+- **20 of 24 python modules are byte-identical to git HEAD `d4c8bf4`** —
+  including `lidar_sector_analyzer.py`, `overtake_safety.py`,
+  `overtake_types.py`, `path_utils.py`. The corridor fix is live:
+  `front_narrow_half_width_m` present in `lidar_overtake_node.py`.
+- **4 modules on the car are NEWER than HEAD and uncommitted**
+  (`ideam.py`, `lidar_overtake_node.py`, `overtake_state_machine.py`,
+  `path_mpc_node.py`, all timestamped 2026-08-06 03:27). Teammate's work,
+  never pushed. It adds: `ideam.constraint_state()` **wired into
+  `OvertakeStateMachine`** with a `PROBE` lane-probing state (PROMPT.md's
+  #1 next step), and a new `ideam.ellipse_barrier_coefficients()` (Eq. 27
+  tangent) building normalized per-stage tangents in `path_mpc_node`.
+  What it does *not* yet do: the barrier constraint row is still the
+  first-order quadratic one (`h_next - (1-gamma)*h_k + S[k]`, gamma=0.35),
+  the tangents are computed but not yet consumed by a constraint, and
+  there is no IPOPT status check.
+- **Deploying git HEAD would have destroyed that work.** Did not deploy.
+  Snapshot saved to `~/qcar_car_state_20260806-050607/` with a README
+  explaining provenance. **It still only exists on the robot and in that
+  backup — it needs committing/pushing.**
+- **Build + symlink chain verified.** `colcon build --symlink-install
+  --packages-select qcar_science_night_pkg` succeeds (3.3 s). Layout is
+  setuptools develop-mode: `install/.../python3.8/site-packages/
+  qcar-science-night-pkg.egg-link` → `build/qcar_science_night_pkg`, whose
+  `qcar_science_night_pkg/` is a **symlink to `src/`**. So editing `src/`
+  is live after a node restart, no rebuild needed. Confirmed live code is
+  byte-identical to `src/` for all 4 changed modules.
+- **Frame calibration survived** — `frame_tx=-4.679956`,
+  `frame_ty=-3.745196`, `frame_tyaw=-0.705757`, `path_spacing=0.05` still
+  in place. Worth noting a naive whole-package rsync **would have wiped
+  this**, since git HEAD's `config/v2v_params.yaml` still ships
+  `0.0/0.0/0.0` and the old `~/ros2_ws` paths. Never sync `config/`.
+- **SSH note for future sessions:** password auth from `rosbot-server`
+  needs `pty.fork()` (helper kept at the session scratchpad's `qssh.py`).
+  A pty merely attached to stdin is not the *controlling* terminal, so
+  ssh falls back to the Ksshaskpass GUI popup or fails outright —
+  `paramiko`/`sshpass`/`expect` are all absent on this machine.
 
 ### Landmark-transform data collection (started 2026-08-05)
 

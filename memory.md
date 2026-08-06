@@ -604,3 +604,584 @@ for today — communication link, fail-safe contract, and the command/gate
 direction are all now verified on real hardware, not just read about or
 bench-tested. Remaining known gap is still the map-frame alignment
 between the two robots' independent SLAM maps (separate open item).
+
+---
+
+# Shared-map migration: QCar 2 map copied to ROSbot 3 (2026-08-06)
+
+**Goal.** Put both vehicles on one map so `frame_tx/ty/tyaw` in QCar 2's
+`v2v_params.yaml` can go back to identity, instead of the measured
+landmark transform. `V2V_README.md` calls the single-map case the intended
+deployment.
+
+**This entry is written so the change can be undone. Nothing was
+overwritten — the step below is purely additive.**
+
+## What was done
+
+Copied from QCar 2 `nvidia@192.168.0.53:~/qcar_v2v_ws/mapping_output/`
+into `rosbot3/config/`:
+
+| file | bytes | md5 |
+|---|---|---|
+| `qcar_real_20260802-014755.pgm` | 38039 | `c7e772c5c700d4c43ea38539d987a7ff` |
+| `qcar_real_20260802-014755.yaml` | 143 | `733265e28a5ba54a74905d9449944985` |
+
+md5 verified identical on the car and after landing in `config/`.
+
+Map parameters:
+
+```
+image: qcar_real_20260802-014755.pgm
+resolution: 0.05
+origin: [-5.47, -5.79, 0]
+occupied_thresh: 0.65
+free_thresh: 0.25
+```
+
+196 x 194 cells @ 0.05 m = **9.80 x 9.70 m**, covering
+x -5.47..4.33, y -5.79..3.91.
+
+> Note: rviz earlier reported 247 x 227 at origin (-5.4653, -7.4435).
+> That is the **live** `/map` topic, which
+> `cartographer_occupancy_grid_node` regenerates from the pose graph; it
+> does not match the saved file. Use the saved `.yaml` values above.
+
+## TO REVERT
+
+Delete the two new files. Nothing else changed:
+
+```bash
+rm rosbot3/config/qcar_real_20260802-014755.pgm \
+   rosbot3/config/qcar_real_20260802-014755.yaml
+```
+
+`config/track_map.{yaml,pgm,data,posegraph}` were **not touched** —
+verified byte-identical before and after (track_map.pgm 35565 B,
+track_map.data 32089695 B, track_map.posegraph 44019871 B). ROSbot 3
+still localizes against its own map until someone changes the `map:=`
+argument, so this copy is inert on its own.
+
+## NOT yet done — required before this map is actually used
+
+1. **Point AMCL at it.** `README.md` §2 Terminal 2 currently launches with
+   `map:=config/track_map.yaml`. Switching to
+   `map:=config/qcar_real_20260802-014755.yaml` is what activates the
+   shared map. Untested.
+2. **Verify AMCL converges in it.** Real risk, not a formality: QCar 2's
+   scan plane is at **0.161 m** (URDF `body_lidar_joint`) and ROSbot 3's
+   LiDAR sits at a different height, so the two see different wall
+   features. The QCar's map may not contain what ROSbot 3's LiDAR
+   returns. Check `/amcl_pose` covariance converges below ~0.02 the way it
+   did during the landmark collection, and do not trust a tight covariance
+   alone — AMCL can converge confidently to a wrong place.
+3. **`config/smoothed_trajectory.csv` becomes invalid.** It holds 540
+   points, 27.02 m, mean spacing 0.0501 m, in **ROSbot-map** coordinates.
+   In the QCar frame those waypoints point somewhere else entirely.
+   **Do not run `trajectory_follower_node.py` after switching maps** until
+   the route is redone.
+4. **Route plan (decided, not yet executed).** Re-record the trajectory on
+   **QCar 2** — it is Ackermann with a minimum turning radius, ROSbot 3 is
+   differential drive and can follow anything the QCar can; the reverse is
+   not true. Then convert format rather than re-smoothing: QCar
+   `my_route_loop.npy` is `(N,3) = x, y, yaw`, already spline-smoothed and
+   resampled at exactly 0.05 m by `smooth_path.py`; ROSbot wants CSV with
+   header `x,y,theta`. Both already use 0.05 m spacing, so it is a direct
+   column mapping. Passing it through `config/smooth.py` again would be
+   double-smoothing and only rounds corners further.
+5. **Start-point conflict on a shared route.** Not a shared-pose problem —
+   each robot localizes independently in the shared frame. The clash is
+   that `path_mpc` accepts the **nearest** waypoint (logs showed
+   `Start alignment accepted at idx=768`, then `idx=655`), while ROSbot's
+   `_handle_rotate_to_start` drives to `self._trajectory.start`, i.e.
+   **waypoint 0**, every time. On one shared route both would converge on
+   waypoint 0. Cheapest fix: stage the QCar ~2 m behind waypoint 0 and
+   change nothing. Durable fix: make `Trajectory.start` honour a
+   configurable `start_waypoint_index` in `core/trajectory.py`.
+6. **Check segment detection on the converted route.** ROSbot's follower
+   splits a trajectory into segments at direction flips
+   (`Trajectory._detect_segments`). The QCar loop was recorded by a vehicle
+   that never reverses, so it should yield one forward segment — confirm
+   that, or ROSbot will try to reverse mid-loop.
+7. **The QCar loop is 38.80 m (777 pts) vs ROSbot's current 27.02 m**, and
+   it contains the loop seam — a synthesised 1.07 m bridge with a wall at
+   0.55 m, curvature previewing at 3.728. ROSbot would inherit both.
+
+## Why this is worth doing
+
+Removes the landmark transform entirely
+(`frame_tx=-4.679956, frame_ty=-3.745196, frame_tyaw=-0.705757`, 3.7 cm
+residual) and with it a whole class of error. Supporting evidence that the
+two are the same physical track: `qcar2_side/sim/assets/track_map.pgm` is
+**byte-identical** to `rosbot3/config/track_map.pgm` (md5
+`c35079fc264688e29057ce3c62e70e34`) — the QCar simulation already runs on
+the ROSbot's map.
+
+## Shared-map switch executed on ROSbot 3 (2026-08-06, same session)
+
+**The `map:=` launch argument does NOT switch the map on this robot.**
+`config/amcl_params.yaml` hard-codes `map_server.ros__parameters.yaml_filename`
+and silently wins over the command line. The first attempt launched with
+`map:=config/qcar_real_20260802-014755.yaml` and *appeared* to succeed, but
+`/map` came back **237 x 150 at origin (-7.712, -0.931)** — ROSbot's own old
+map. Anyone following README §2 alone would believe they had switched maps
+while still running the old one.
+
+**Real switch point:** `config/amcl_params.yaml`, the `yaml_filename` line.
+Now set to `config/qcar_real_20260802-014755.yaml`, with the previous value
+commented directly above it. Original backed up to
+`/tmp/rosbot_logs/amcl_params.yaml.bak` (session-temp -- copy somewhere
+durable if it matters). README §2 updated with the same comment and a note
+that the params file, not `map:=`, is what takes effect.
+
+**Confirmed loaded after the fix:** `/map` reports 196 x 194 @ 0.05,
+origin (-5.47, -5.79) -- matches the QCar file exactly.
+
+**Stack brought up** (trajectory follower deliberately NOT started, so the
+robot cannot drive itself): `tf_relay`, `map_server`, `amcl`, all activated
+manually via `ros2 lifecycle set` because `nav2_lifecycle_manager` still
+dies on the `diagnostic_updater` undefined-symbol ABI mismatch (shared
+machine, no sudo) -- unchanged from earlier sessions.
+`/rosbot3/scan` confirmed flowing, AMCL correctly configured to it
+(`scan_topic: "/rosbot3/scan"`).
+
+**Convergence: NOT yet achieved.** After
+`reinitialize_global_localization`, `/amcl_pose` covariance read
+**x=8.4728, y=7.1074, yaw=6.2727** against a <0.02 target -- a fully
+dispersed particle cloud. This is expected while stationary: global
+localization scatters particles across the whole map and needs **motion**
+to collapse them. It is NOT yet evidence for or against the shared map.
+
+**Blocked on motion, and the robot is boxed in.** Its own LiDAR reports
+**0.132 m to the nearest return forward** (+/-20 deg); backward is clear at
+1.224 m; 171 returns inside 1.0 m. Forward motion would collide almost
+immediately, so no drive command was issued.
+
+**The open question the next session must answer:** drive ROSbot a few
+metres and re-read the covariance.
+  - converges < 0.02  -> shared map works; set QCar's
+    `frame_tx/ty/tyaw` to identity and retire the landmark transform
+    (-4.679956, -3.745196, -0.705757).
+  - stays dispersed    -> the QCar's map does not contain what ROSbot's
+    LiDAR sees. QCar scan plane is 0.161 m (URDF `body_lidar_joint`);
+    ROSbot's LiDAR sits elsewhere, so they may not share wall features.
+    Shared-map approach then needs rethinking, not forcing.
+
+**Do not trust a tight covariance on its own** -- check the pose is
+physically where the robot actually is. QCar 2 spent this morning
+confidently 3.9 m wrong with convincing covariance.
+
+**To revert everything:** restore the `yaml_filename` line in
+`config/amcl_params.yaml` (previous value is in the comment above it), and
+optionally delete the two copied map files. Nothing else was changed.
+
+## RESULT: shared map WORKS on ROSbot 3 -- and the card collar was blinding it
+
+**Verdict: ROSbot 3 localizes successfully in QCar 2's Cartographer map.**
+The height-mismatch worry (QCar scan plane 0.161 m vs ROSbot's LiDAR) does
+**not** block it. The shared-map plan is viable.
+
+### The real blocker was the card collar, not the map
+
+The collar taped to ROSbot 3 so QCar 2's LiDAR can see it was sitting **in
+ROSbot 3's own LiDAR plane**. Measured across 60 consecutive scan frames: a
+persistent continuous arc of returns from **-55 deg to +40 deg at
+0.08-0.17 m** -- about 95 degrees of the forward view. Not a wall (a flat
+wall at 0.085 m would read 0.111 m at 40 deg; it read 0.174 m), and not a
+clean circle: an irregular surface wrapped close around the front.
+
+Effect: AMCL was fed a phantom obstacle at ~0.1 m across its whole forward
+arc, matching nothing in any map. `amcl_params.yaml` sets
+`laser_min_range: 0.1` and these returns straddle it (0.079-0.17 m), so
+many passed the filter and poisoned the likelihood field. **AMCL could not
+have converged in ANY map in that state** -- so the earlier dispersed
+covariance was never evidence against the shared map.
+
+With the collar removed the arc vanished; only a 13-beam band at -20 deg /
+0.131 m remains, which is fixed structure and rotates with the robot.
+
+### Convergence measurement (rotation in place, 0.40 rad/s, ~4.8 revs)
+
+| t | cov x | cov y | cov yaw | pose |
+|---|---|---|---|---|
+| 5 s | 6.1812 | 4.6340 | 2.8255 | (+1.21, +0.58) |
+| 20 s | 0.4817 | 5.0014 | 5.4038 | (-1.34, -4.20) |
+| 35 s | 0.0723 | 0.3497 | 0.1182 | (-0.12, -0.08) |
+| 50 s | 0.0469 | 0.0272 | 0.0285 | (-0.15, -0.12) |
+| 65 s | 0.0322 | 0.0194 | 0.0242 | (-0.21, -0.12) |
+| final | 0.0336 | 0.0217 | 0.0243 | (-0.261, -0.084) |
+
+~200x collapse in x and y; pose stops wandering after t=35 s and settles
+near (-0.2, -0.1). Rotation alone gets y to 0.019; x stays ~0.03 because
+pure rotation carries little position information. A short translation
+should close that.
+
+### CONFLICT this creates for the V2V work -- unresolved
+
+`PROMPT.md` records that **without** the collar, QCar 2's LiDAR returns
+*literally zero* points off the ROSbot -- the collar is what makes ROSbot
+detectable for obstacle avoidance and overtaking. So:
+
+* collar ON  -> QCar sees ROSbot; ROSbot cannot localize
+* collar OFF -> ROSbot localizes; QCar cannot see ROSbot
+
+Both are needed simultaneously. Likely fix is **height**: mount the collar
+so it sits above ROSbot 3's own scan plane while still intersecting QCar
+2's at 0.161 m. Requires measuring ROSbot 3's LiDAR height -- not yet done.
+Until resolved, any overtake test needs the collar and therefore cannot
+rely on ROSbot 3's AMCL at the same time.
+
+### Still to verify
+
+Covariance is not proof of correctness. **Confirm the converged pose is
+physically where the robot actually is** before trusting it -- QCar 2 spent
+this morning confidently 3.9 m wrong with tight covariance.
+
+### Translation check -- covariance DEGRADED (unresolved)
+
+Rotation converged; a short forward drive did not. Drove 0.12 m/s, moved
+**0.76 m** in the map:
+
+| | cov x | cov y | cov yaw | pose |
+|---|---|---|---|---|
+| start | 0.0343 | 0.0252 | 0.0229 | (-0.22, +0.05) |
+| +5 s | 0.0346 | 0.0290 | 0.0245 | (-0.17, +0.18) |
+| final | **0.1635** | **0.1248** | **0.2189** | (+0.213, +0.679) |
+
+Covariance grew ~5x and did not recover. AMCL uncertainty normally grows
+with motion then shrinks as scan matches confirm the pose; it growing and
+staying grown suggests scan matching is not confirming well in the QCar map
+once ROSbot leaves the spot it converged on. **So the shared map is proven
+for rotation-in-place but NOT yet for driving.** Do not treat the earlier
+convergence as sufficient.
+
+Run aborted safely by the 0.45 m forward guard. Note forward clearance fell
+**4.82 m -> 0.448 m while the robot travelled only ~0.84 m** -- something
+entered its path (person, or the QCar). Not identified.
+
+**Next:** confirm the reported pose (+0.213, +0.679) is physically where
+the robot actually is. If the pose is wrong, the degradation is a bad match,
+not sensor noise. A ROSbot-side version of `qcar2_side/utils/map_web_view.py`
+(retargeted at `/rosbot3/scan`, `/map`, and the ROSbot TF tree) would settle
+it visually -- the check that matters is whether scan returns land on the
+mapped walls.
+
+### CONFIRMED: ROSbot 3 localizes correctly in QCar 2's map (drive test)
+
+Drove ROSbot ~7 m under a 0.45 m obstacle guard (0.12 m/s, turning away when
+blocked), scoring **scan-vs-map match** = fraction of scan endpoints landing
+within one cell of an occupied map cell. Covariance says how *confident*
+AMCL is; this says whether it is *right*.
+
+| t | pose | cov x | match |
+|---|---|---|---|
+| 6 s | (-0.09, +0.65) | 0.1672 | **12.4%** |
+| 18 s | (-1.80, -0.16) | 0.0223 | **77.4%** |
+| 30 s | (-3.32, -0.18) | 0.0178 | **91.1%** |
+| 42 s | (-4.32, -0.19) | 0.0204 | 72.7% |
+| 54 s | (-4.26, -0.25) | 0.1101 | 19.0% |
+| 66 s | (-2.84, -1.51) | 0.0692 | 4.0% |
+| 78 s | (-1.51, -2.90) | 0.0148 | 59.7% |
+| final | (+0.064, -3.422) | 0.0322 | **66.6%** |
+
+**Verdict: the shared map is viable.** 91% match is a genuine lock, so the
+0.131 m (ROSbot) vs 0.161 m (QCar) LiDAR height difference does not prevent
+localization. `frame_tx/ty/tyaw` can go to identity once the route is
+redone.
+
+**Confirms the earlier failure was AMCL locked on a wrong pose, not a bad
+map.** At t=6 s the pose was still (-0.09,+0.65) -- essentially where it had
+been sitting -- with only 12.4% match. It needed *translation* to escape;
+rotation in place had produced tight covariance (0.03) at a wrong pose.
+**Covariance alone would have lied.** Same failure mode as QCar 2 being
+confidently 3.9 m wrong.
+
+**Map coverage is uneven -- plan around it.** Match swung 91% -> 4% -> 63%
+depending on location. Cartographer built this map along a driving route, so
+coverage is good near the path and thin away from it. Expect reliable
+localization on-route and degradation off-route. Not a blocker; it does
+constrain where things can be staged.
+
+**Method note for future sessions:** the match score is the check worth
+trusting, not covariance. Implementation in
+`/tmp/rosbot_logs/drive_converge.py` (session-temp -- copy into the repo if
+it is wanted long term). Viewer equivalent on :8092, cv2-based because
+matplotlib on rosbot-server is broken by a numpy 1.x/2.x ABI split
+(`numpy.core.multiarray failed to import`); system python has working
+numpy 2.3.0 + cv2 4.13.0 + rclpy.
+
+**Also measured:** ROSbot 3 `base_link -> laser` is xyz (+0.020, 0, +0.131)
+with **yaw = 180 deg** -- the same mounting flip as the QCar. Any tool
+plotting scan angles against the body pose must add pi.
+
+## Shared route converted and verified on the shared map (2026-08-06)
+
+**Decision:** both vehicles drive the SAME 38.8 m loop. ROSbot keeps its
+existing behaviour of starting at waypoint 0; the QCar is staged elsewhere
+on the loop, which sidesteps the start-point clash entirely with no code
+change (`path_mpc` accepts the nearest waypoint, ROSbot always drives to
+waypoint 0).
+
+### Files now in `rosbot3/config/`
+
+| file | provenance |
+|---|---|
+| `qcar_real_20260802-014755.pgm` / `.yaml` | QCar Cartographer grid, md5 `c7e772c5...` verified |
+| `shared_route.csv` | 777 pts, converted from the QCar's `my_route_loop.npy` |
+| `qcar_route_to_csv.py` | the converter, with ROSbot-segment validation |
+
+`my_route_loop.npy` fetched from
+`nvidia@192.168.0.53:~/qcar_v2v_ws/mapping_output/`, md5
+`f26406d27f38be47b13479de2a9736c2`, verified after transfer.
+
+### Conversion result -- clean
+
+```
+points        : 777
+length        : 38.80 m
+spacing       : mean 0.0500 m (min 0.0500, max 0.0500)
+loop closure  : 0.018 m between last and first
+bbox          : x -3.44..+2.09   y -4.00..+0.10
+direction flips (dot < -0.5) : 0   (min dot +0.995)
+initial segment reversed     : False  (travel vs heading 1.0 deg)
+```
+
+Zero flips with min dot +0.995 -- nowhere near the -0.5 threshold -- so
+`Trajectory._detect_segments` sees ONE continuous forward segment and the
+ROSbot will not try to reverse mid-loop. Spacing min == max, so no gaps.
+
+**Deliberately NOT re-smoothed.** The QCar's `smooth_path.py` already spline
+-fitted and resampled at 0.05 m; running it through `config/smooth.py` again
+would round the corners a second time. The converter only changes container
+(`.npy` (N,3) x,y,yaw -> CSV x,y,theta) and wraps yaw to +/-pi.
+
+### Visual confirmation -- resolves the "track outside the walls" question
+
+Rendered the converted route on the shared map: **the loop sits neatly
+inside the walled area**, ~0.9 m clear of the left wall and ~0.5 m of the
+bottom, never crossing a wall or leaving mapped free space. Waypoint 0 is
+at the top of the loop just below the north wall.
+
+The earlier "track is outside the walls" was the frame-mismatched overlay --
+ROSbot's own `smoothed_trajectory.csv` (ROSbot map frame) painted on the
+QCar map. With the correct route in the correct frame everything agrees, and
+**the map is the one the QCar's test runs validated**. My earlier
+"the .pgm is a stale export" theory was wrong; the 247x227 vs 196x194
+difference is just Cartographer's live grid regenerating from the pose graph
+versus the saved export.
+
+### MUST DO before this route drives anything
+
+1. **Point the V2V broadcaster at it too** --
+   `-p trajectory_csv:=config/shared_route.csv`. The follower reads it, but
+   so does `rosbot_v2v_broadcaster.py`, which rolls the robot forward along
+   that route to predict its next 2 s and transmits those 26 poses. That
+   prediction feeds the QCar's DCBF keep-out and its overtake/yield calls.
+   Left on the old CSV, the QCar plans around a path in the wrong frame.
+2. **Set `frame_tx/ty/tyaw` to 0** in the QCar's `v2v_params.yaml` once the
+   shared map is confirmed in use -- currently
+   (-4.679956, -3.745196, -0.705757). NOT yet done.
+3. **The loop seam is in this route** -- the synthesised 1.07 m bridge with
+   a wall at 0.55 m, previewing at kappa 3.728. ROSbot now inherits it. Do
+   not stage a pass there.
+
+### To revert
+
+Delete `config/shared_route.csv`; restore `yaml_filename` in
+`config/amcl_params.yaml` (previous value is in the comment above it).
+`config/smoothed_trajectory.csv` was never modified.
+
+---
+
+## Session 2026-08-06 (evening): first ROSbot run on the shared route — 3 bugs found
+
+`trajectory_follower_node.py` was pointed at `config/shared_route.csv` and
+run. **It drove off the route and had to be stopped by hand.** Three
+separate defects, all of which only appear on the QCar's route. All three
+are now fixed; the run has NOT been repeated (battery, see below).
+
+### What the log showed
+
+```
+Aligned! Starting Segment(FWD: WP 0 → 776)
+[FWD] Seg 1/1 | WP 33 → LA:40  | Goal: 1.62m
+[FWD] Seg 1/1 | WP 33 → LA:503 | Goal: 1.50m     <- lookahead jumped 460 wp
+[FWD] Seg 1/1 | WP 33 → LA:618 | Goal: 4.16m     <- and again, now 4 m off route
+Overtake: detour generated, 21 pts, rejoin at WP 275
+Obstacle at 0.39m -> 0.10m -> 0.05m -> 0.02m     <- driving into something
+```
+
+`WP 33` never advanced; `LA` jumped between 40, 284, 503, 618, 706.
+
+### Bug 1 — the "38.8 m loop" is 3 laps of a 13.15 m circuit
+
+Not a long loop. `my_route_loop.npy` returns to within 0.04 m of waypoint 0
+at **wp 263**, and 0.018 m at wp 776. 777 / 263 = 2.95 laps.
+
+Consequence: **97% of the 777 waypoints sit within 0.60 m of a
+non-adjacent waypoint**, minimum self-approach **0.002 m**. wp 33 is 0.16 m
+from wp 493. `Trajectory.find_closest_waypoint` did a global argmin over the
+whole segment, so it was choosing between laps essentially at random.
+
+Offline replay of the recorded route with 6 cm of simulated AMCL jitter:
+
+| route | backward index jumps > 5 wp | max index error |
+|---|---|---|
+| 777 pts (3 laps), old global search | **147** | **517 wp (25 m)** |
+| 263 pts (1 lap), old global search | 0 | 5 wp |
+| 263 pts (1 lap), new windowed search | 0 | 5 wp |
+
+**Fix:** `config/qcar_route_to_csv.py` gained `--single-lap` (truncates at
+the first return to the start) plus a self-approach measurement that makes
+it **refuse to write** when > 5% of waypoints are ambiguous.
+`config/shared_route.csv` is now **263 pts / 13.10 m**, 0% ambiguous,
+minimum self-approach 1.468 m. The 3-lap version is at
+`/tmp/rosbot_logs/shared_route_3lap.csv.bak`.
+
+### Bug 2 — `find_closest_waypoint` searched globally
+
+Even one lap closes on itself: wp 0 and wp 262 are 0.081 m apart. Measured
+with the old global search, a robot sitting *behind* waypoint 0 — exactly
+where it starts — resolved to the **end** of the route:
+
+| robot position | old search | new search |
+|---|---|---|
+| 0.30 m behind wp0 | wp 257 | wp 0 |
+| 0.15 m behind wp0 | wp 260 | wp 0 |
+| 0.05 m behind wp0 | wp 262 | wp 0 |
+
+**Fix:** `rosbot_lane/core/trajectory.py` — the search is now windowed to
+`[_search_anchor - 20, _search_anchor + 100]` (−1.0 m / +5.0 m), and the
+anchor advances on its own. Deliberately *not* keyed off `current_wp_idx`:
+`advance_waypoint` only advances while the next waypoint is within 0.12 m,
+so it **freezes permanently** the moment the robot drifts off route — that
+is why the log showed `WP 33` forever. The anchor cannot freeze that way.
+
+`_search_anchor` is reset in `reset()` and `advance_segment()`.
+
+### Bug 3 — segment goal fires before the robot moves
+
+`_segment_goal_tolerance = 0.04` (`trajectory_follower_node.py:82`) against
+an 0.081 m start-finish gap, with ~6 cm of AMCL jitter. The follower would
+have declared the lap complete while standing still.
+
+**Fix:** `reached_segment_goal` now also requires
+`_search_anchor >= seg.end_idx - SEARCH_BACK`, i.e. the robot must actually
+have travelled to the far end. Verified: `False` at every distance behind
+wp 0 before driving, `True` after walking the lap.
+
+### Also fixed: two stacks were running at once
+
+`ps` showed **two** `tf_relay` and **two** `localization_launch`
+(2 × `map_server` + 2 × `amcl`). Same duplicate-process class that caused
+the earlier TF flapping. The *older* AMCL (pid 27955, started 20:13:47) was
+the live one — identified by CPU time (11076 ticks and climbing vs 119
+frozen), not by age. It loaded the shared map correctly: `amcl_params.yaml`
+was edited at 20:12:48, **59 s before** it started, and live `/map` is
+196×194 @ origin (−5.470, −5.790). The idle duplicate set was killed by
+explicit PID.
+
+> Lesson repeated for the third time: identify the live process by **CPU
+> time**, and kill by **explicit PID**, never `pkill -f`.
+
+### Why the run was not repeated
+
+- **Battery flat.** `/rosbot3/battery` (not `battery_state`) read 9.84 V and
+  falling at −1.7 V/hour, `percentage` 0, `current` NaN — not charging. The
+  3S pack cuts out around 9.0 V and sags further under motor load.
+- **Localization degraded.** Scan-map match had dropped to **51.9%**
+  (1342/2588 endpoints) from ~71% earlier in the session. Below the ~70%
+  bar we set for trusting a pose. Pose was `(−0.404, −0.038) yaw +123.9°`,
+  0.014 m from wp 2.
+
+Both need clearing before the next attempt. Charge first, then re-check the
+match score before commanding motion.
+
+### Unrelated issue seen, not fixed
+
+`_closest_in_region` rejects returns below `msg.range_min`, but the ROSbot's
+LiDAR reports `range_min = 0.050` while its real blind zone is much larger.
+Returns in 0.05–0.15 m are noise and are currently trusted. During the run
+the obstacle distance flapped inf ↔ 0.05 m ↔ 0.02 m, and because the
+hysteresis is stop-at-0.40 / resume-at-0.50, each "clear" let the robot
+resume at full 0.40 m/s. Worth raising the floor to ~0.15 m.
+
+## Collar conflict RESOLVED (2026-08-06, evening)
+
+A second collar was fitted that **clears the ROSbot's 0.131 m scan plane
+while still intersecting the QCar's 0.161 m** -- roughly a 3 cm window.
+Both properties now hold at once:
+
+- ROSbot's AMCL is no longer blinded (the old collar put a persistent 95 deg
+  arc at 0.08-0.17 m across its scan and stopped it converging in *any* map)
+- QCar's LiDAR gets returns off the ROSbot again, so `obstacle_ahead` is set
+  by the physical sensor
+
+**This closes the open item "collar conflict" and changes the overtake
+picture.** The QCar's `DRIVE -> WAIT_FOR_CLEAR -> OVERTAKE_LEFT` path runs
+with no V2V trigger at all; `should_inject_slow_v2v_lead` gates only the V2V
+*early-warning injection*, not the primary path. The earlier conclusion
+"QCar will follow at 0.70 m and never pass" was conditioned on there being
+no collar and no longer applies.
+
+**Detection was never the cause of the recorded deadlock.** `PROMPT.md`'s
+"detects the ROSbot, stops in WAIT_FOR_CLEAR, never commands a lateral
+offset" was observed *with* the original collar. That is `can_avoid`
+failing:
+
+- `allow_overtake` is published by the MPC curvature preview
+  (`path_mpc_node.py:1896`), not a static parameter. The bend measured 1.396
+  against a hard cap of 1.0 -- no legal value authorises a pass there.
+  Location-dependent; stage passes on a straight.
+- `left_clear` read the outside road edge in a bend -- the curve-corridor
+  bug. That fix **is now present** in the repo (`front_narrow_min` in
+  `lidar_overtake_node.py`, `lidar_sector_analyzer.py`, `overtake_types.py`,
+  `overtake_safety.py`).
+
+**Cheapest next experiment:** park the ROSbot *unpowered* on a straight as a
+passive obstacle and drive the QCar at it. Needs no ROSbot battery (flat at
+9.8 V) and no V2V, and isolates the curve-corridor fix from everything else.
+
+Plan for the paper-grounded improvement (lane-probing state, IDEAM Sec. V) is
+in `qcar2_side/IDEAM_LP_PLAN.md`, untracked so it does not disturb the
+teammate until pushed.
+
+## Map decision: keep the SHARED map for V2V (2026-08-06)
+
+Asked whether the old ROSbot map + landmark transform would be better than
+the shared QCar map. **Shared map wins.** Computed from the round-2 landmark
+readings in `TODO.md`:
+
+- The two maps disagree by **7.3 cm** about the distance between the same two
+  physical landmarks (1.0941 m in the QCar map vs 1.0209 m in ROSbot's) -- a
+  **6.9% scale error**. A rigid transform preserves distance, so this is
+  irreducible; the recorded "3.7 cm residual" is just that disagreement split
+  evenly between the two points, not a quality measure.
+- Baseline is only **1.06 m** for a track spanning 5.5 x 4.1 m, giving a
+  **1.98 deg** heading uncertainty that extrapolates to **9.1 cm at the
+  nearest route point and 22.0 cm at the farthest** (1.58 m / 5.30 m from the
+  landmark midpoint). That is 55-63% of `V2V_ELLIPSE_B` (0.40) and
+  `lane_half_width` (0.35) before any localization error.
+
+**Decisive argument is not calibration, it is `on_path`.** Already measured
+2026-08-05: `lat_offset = -0.451 m` vs a 0.35 m threshold, logged then as
+"genuine physical divergence between ROSbot 3's recorded route and QCar 2's
+specific reference lane". The transform aligns *frames*, not *routes* -- with
+separate maps the two vehicles drive different physical lines and `on_path`
+drops wherever they diverge. `on_path` is a hard gate on both
+`should_inject_slow_v2v_lead` and the speed governor, so every V2V behaviour
+goes inert there. Shared map + shared route makes `lat_offset ~ 0` by
+construction.
+
+Counter-argument considered and rejected: transform error is a *bounded
+systematic bias* while shared-map localization failure is an *unbounded
+jump*. True, but the measured shared-map match is 91% on-route vs 4%
+off-route -- the error is bounded by staying on the route, which is what the
+follower fixes deliver. The 51.9% measured today was taken after the failed
+run had already driven the robot off-route.
+
+**If shared-map localization ever does prove unreliable, the fallback is NOT
+the old map** -- it is to re-record the shared map with the ROSbot's LiDAR
+and give that to the QCar. Sharing in the other direction keeps the
+single-frame property while removing the 0.131 / 0.161 m sensor-height
+mismatch.
