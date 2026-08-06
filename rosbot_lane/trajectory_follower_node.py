@@ -45,7 +45,14 @@ class State(Enum):
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
-TRAJECTORY_PATH = WORKSPACE_ROOT / 'config' / 'smoothed_trajectory.csv'
+# Shared route: one lap (263 pts, 13.1 m) of QCar 2's circuit, converted by
+# config/qcar_route_to_csv.py --single-lap. Must match the map AMCL is running
+# -- see config/amcl_params.yaml. Pairing a route with the wrong map drives to
+# waypoints that do not exist there. One lap, not the full 777-point recording:
+# that is three laps of the same circuit and this class cannot follow it.
+#   PREVIOUS (ROSbot 3's own map frame, pair with config/track_map.yaml):
+#   TRAJECTORY_PATH = WORKSPACE_ROOT / 'config' / 'smoothed_trajectory.csv'
+TRAJECTORY_PATH = WORKSPACE_ROOT / 'config' / 'shared_route.csv'
 SOUND_DIR = WORKSPACE_ROOT / 'rosbot_lane' / 'core'
 
 

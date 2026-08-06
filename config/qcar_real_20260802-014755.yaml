@@ -1,0 +1,13 @@
+# Shared map -- QCar 2's Cartographer occupancy grid, exported from
+# nvidia@192.168.0.53:~/qcar_v2v_ws/mapping_output/
+# Copied 2026-08-06. Source md5 (pgm) c7e772c5c700d4c43ea38539d987a7ff
+# PREVIOUS map for ROSbot 3, still present and unmodified:
+#   config/track_map.yaml   (slam_toolbox, origin [-7.712, -0.931, 0])
+# See memory.md -> 'Shared-map migration' for revert instructions.
+image: qcar_real_20260802-014755.pgm
+mode: trinary
+resolution: 0.05
+origin: [-5.47, -5.79, 0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.25

@@ -123,11 +123,25 @@ python3 rosbot_lane/tf_relay.py
 **Terminal 2: Launch AMCL for Localization**
 
 ```bash
+# Shared map: QCar 2's Cartographer map, so both vehicles localize in one
+# frame and v2v_params.yaml's frame_tx/ty/tyaw can stay at identity.
+#   PREVIOUS (ROSbot 3's own slam_toolbox map, still present, revert here):
+#   map:=config/track_map.yaml
 ros2 launch nav2_bringup localization_launch.py \
-  map:=config/track_map.yaml \
+  map:=config/qcar_real_20260802-014755.yaml \
   params_file:=config/amcl_params.yaml \
   use_sim_time:=false
 ```
+
+> **Switching maps invalidates `config/smoothed_trajectory.csv`.** Those 540
+> waypoints are in ROSbot-map coordinates and mean nothing in the QCar
+> frame. Do not run `trajectory_follower_node.py` until the route is
+> re-recorded — see `memory.md`, "Shared-map migration".
+>
+> Verify AMCL actually converges in this map before trusting it: QCar 2's
+> scan plane sits at 0.161 m and ROSbot 3's LiDAR is at a different height,
+> so the two may not see the same wall features. A tight covariance alone
+> is not proof — AMCL can converge confidently onto the wrong place.
 
 **Terminal 3: Activate Lifecycle Nodes and Initialize Localization**
 
@@ -148,7 +162,92 @@ ros2 service call /reinitialize_global_localization std_srvs/srv/Empty
 python3 rosbot_lane/trajectory_follower_node.py
 ```
 
-## 3. V2V Status Dashboard (ROSbot 3 ↔ QCar 2)
+## 3. V2V Link (ROSbot 3 → QCar 2)
+
+The link is asymmetric: ROSbot 3 only broadcasts its state and predicted
+path, and QCar 2 receives and decides. It rides raw UDP on port 47100, not
+DDS, so the two robots keep separate ROS graphs (see
+`rosbot_lane/rosbot_v2v_broadcaster.py`'s docstring for why).
+
+**Both ends must be running** — the receiver alone publishes nothing, and
+`/v2v/alive` stays false.
+
+**On ROSbot 3** (this repo; `tf_relay` + AMCL from section 2 must already be
+up and converged, or every packet is marked not-localized):
+
+```bash
+cd ~/rosbot3
+python3 rosbot_lane/rosbot_v2v_broadcaster.py --ros-args \
+  -p target_ip:=192.168.0.53 \
+  -p trajectory_csv:=/BIGDATA_1TB/home/saan5276/rosbot3/config/shared_route.csv
+```
+
+> **`trajectory_csv` must match the map AMCL is running.** The broadcaster
+> does not just send the current pose — it rolls the robot forward *along
+> this route* to predict its next 2 s and transmits those 26 poses, and that
+> prediction is what feeds QCar 2's DCBF keep-out and its overtake/yield
+> decisions. Point it at a route in a different frame than the robot's pose
+> and the QCar plans around a path that does not exist.
+>
+> `config/shared_route.csv` is **one lap** (263 pts, 13.1 m) of the QCar's
+> circuit, converted from `my_route_loop.npy` by
+> `config/qcar_route_to_csv.py --single-lap`, so it is in the shared map's
+> frame. Use it whenever `amcl_params.yaml` points at
+> `qcar_real_20260802-014755.yaml`.
+>
+> The `.npy` is 777 pts / 38.8 m, but that is **three laps of the same
+> 13.15 m circuit**, not one long loop. The ROSbot's `Trajectory` has no lap
+> concept and its searches assume the route never revisits itself, so the
+> full recording is unusable: 97% of its waypoints sit within 0.60 m of a
+> different lap (closest approach 0.002 m), which makes
+> `find_closest_waypoint` snap to the wrong branch. The converter now
+> measures this and refuses to write without `--single-lap`.
+>
+> The previous route, `config/smoothed_trajectory.csv`, is in ROSbot 3's
+> **own** map frame — pair it only with `config/track_map.yaml`.
+
+**On QCar 2** (`~/qcar_v2v_ws`, sourced with `ROS_DOMAIN_ID=42` and
+`ROS_LOCALHOST_ONLY=1`):
+
+```bash
+ros2 run qcar_science_night_pkg v2v_receiver --ros-args \
+  --params-file /home/nvidia/qcar_v2v_ws/src/qcar_science_night_pkg/config/v2v_params.yaml
+```
+
+### Verifying the link
+
+On QCar 2, with the same sourcing:
+
+```bash
+ros2 topic echo /v2v/alive std_msgs/msg/Bool --once
+```
+
+> Always pass the message type explicitly. A bare
+> `ros2 topic echo /v2v/alive` has to look the type up through the graph
+> first and gives up almost immediately under discovery latency, which looks
+> identical to "nothing is publishing". Same trap applies to
+> `ros2 node list` and `ros2 topic hz`.
+
+If it hangs with no output at all, nothing is publishing — check the
+receiver is actually alive with `ps aux | grep -c "[v]2v_receiver"`.
+
+If it prints `false`, the raw log says which half is at fault:
+
+```bash
+tail -3 /home/nvidia/qcar_v2v_ws/v2v_rx_log.csv
+```
+
+Columns are
+`t_rx,seq,age_gap_ms,x,y,yaw,v,localized,moving,qcar_idx,rosbot_idx,gap,lat_offset,on_path`.
+The **8th field is `localized`**:
+
+| Symptom | Meaning |
+|---|---|
+| File growing, `localized` = 1 | Link healthy; `/v2v/alive` should be true |
+| File growing, `localized` = 0 | Packets fine, ROSbot 3's AMCL has not converged. Every V2V gate treats this as *no data*, never as "clear", so the QCar's DCBF keep-out is inert. |
+| File not growing | No packets arriving — broadcaster down, wrong `target_ip`, or the two machines cannot reach each other |
+
+## 4. V2V Status Dashboard (ROSbot 3 ↔ QCar 2)
 
 `rosbot_lane/v2v_dashboard.py` is a single self-contained script that runs
 on **both** robots (one instance each) and serves a combined web page:
