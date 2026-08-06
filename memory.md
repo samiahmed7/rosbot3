@@ -1185,3 +1185,168 @@ the old map** -- it is to re-record the shared map with the ROSbot's LiDAR
 and give that to the QCar. Sharing in the other direction keeps the
 single-frame property while removing the 0.131 / 0.161 m sensor-height
 mismatch.
+
+---
+
+# QCar 2 LiDAR-only overtake attempts (2026-08-07)
+
+Three runs against a parked, unpowered ROSbot 3. **No pass completed.** The
+cause is track geometry, not the overtake logic -- see "Why it cannot pass"
+below. Everything else in the chain was proven working.
+
+## What was proven working
+
+- **The new collar works.** QCar picked the ROSbot up at 2.86 m and tracked
+  it down to 0.88 m, `nc=8` points in the narrow corridor. The collar
+  conflict is fully resolved: ROSbot's 0.131 m plane is clear, QCar's
+  0.161 m plane gets returns.
+- **Shared map works for the QCar.** Localized to 0.004 m of waypoint 255,
+  `track_err` ~0.02 m for a complete 13.15 m lap.
+- **Curve-corridor fix is live in the runtime** (`front_narrow_min` present
+  in all four modules, confirmed by importing them, not just grepping src).
+- **`LANE_PROBE` fires** -- `DRIVE -> LANE_PROBE -> DRIVE` observed.
+- **Every stop was a safety gate doing its job**, never a crash.
+
+## Deployed parameters are NOT the repo defaults
+
+Read back from `~/qcar_v2v_ws`. Always read these off the car, never assume:
+
+| parameter | repo default | deployed |
+|---|---|---|
+| `front_stop_straight_m` | 0.90 | **1.60** |
+| `front_box_max_m` | 0.90 | **2.20** |
+| `overtake_offset_m` | 0.47 | **0.62** |
+| `min_overtake_progress_m` | 0.80 | **1.85** |
+| `lane_clear_distance_m` | 0.75 | **0.45** |
+| `overtake_max_curvature` | 0.40 | **0.90** |
+| `overtake_mean_curvature` | 0.25 | **0.50** |
+| `overtake_preview_distance_m` | -- | **2.75** |
+
+`overtake_preview_distance_m` 2.75 is exactly `min_overtake_progress_m`
+1.85 + `min_return_progress_m` 0.90. Self-consistent, zero margin.
+
+## Four deployment bugs found and fixed
+
+1. **`path_mpc` defaults to `~/ros2_ws`.** `trajectory_file` and `map_file`
+   default to `~/ros2_ws/recorded_path_amcl_final_long.npy` /
+   `track_map_new.yaml`, while Cartographer loads the shared pbstream from
+   `~/qcar_v2v_ws`. Validation failed: "30.9% of path points are outside
+   map". The stock `science_night.launch.py` does not override them.
+2. **`require_amcl_quality` is unsatisfiable on a Cartographer stack.**
+   Nothing publishes `/amcl_pose` (0 publishers). Set False; localization
+   was confirmed independently instead (tracking stably, 4 mm from a
+   recorded waypoint).
+3. **Multi-lap index ambiguity hits the QCar too.** `my_route_loop.npy` is
+   three laps of a 13.15 m circuit. A car parked at the start resolves to
+   lap 3 (idx ~768/777) and declares "Forward trajectory complete" after
+   0.25 m. Same class as the ROSbot's `find_closest_waypoint` bug.
+4. **Duplicate stacks lock out motion.** `nav2_qcar2_converter` refuses to
+   output when >1 publisher exists on `/cmd_vel_nav`: "2 publishers remain
+   on /cmd_vel_nav; output is stopped". Every node was running twice
+   because the stop script matched `science_night\.launch\.py` and missed
+   `science_night_shared.launch.py`.
+
+## Why it cannot pass on this circuit
+
+Computed with the node's **own** functions (`path_curvature_from_xy`,
+`offset_path_curvature`, `overtake_curvature_preview`) -- a hand-rolled
+`np.gradient` version was too noisy at 0.05 m spacing and wrongly reported
+0 authorized waypoints. Use the node's functions.
+
+- **28 of 777 waypoints (3.6%) authorize a pass**, one stretch: wp 231-258,
+  **1.40 m**, at (+1.31,+0.07) -> (-0.02,-0.02). At its centre the geometry
+  is clean (max kappa 0.21 vs a 0.90 limit).
+- A completed pass needs **4.35 m** of authorized path (1.60 detect + 1.85
+  overtake + 0.90 return). The best available is 1.40-1.60 m.
+- Lap curvature: median 0.57, p90 1.40, max 1.94. **5% of the lap is bent
+  tighter than the 0.62 m passing offset itself**, where the offset
+  reference is geometrically degenerate.
+- Whole map is 5.53 x 4.10 m. **There is no 4.35 m straight on this track.**
+
+### The `loop_path` seam is unsatisfiable
+
+With `loop_path=True` the validator needs `loop_gap <= 0.15 m` AND
+`seam_steering <= 0.50 rad`. These conflict directly -- shrinking the gap
+is exactly what forces the seam turn tighter:
+
+| cut | failure |
+|---|---|
+| 258-261 | gap 0.33 / 0.28 / 0.23 / 0.18 m > 0.15 |
+| 262-267 | seam 0.64 / 1.01 / 1.38 / 1.49 / 1.48 / 1.45 rad > 0.50 |
+
+**No cut satisfies both.** Use `loop_path=False` and drive the lap once.
+
+### The 0.62 m offset is too wide for this track
+
+`Maximum-offset path contains degenerate curvature` is logged at startup.
+Degenerate points in the offset reference vs offset width:
+
+| offset | degenerate pts | max abs k |
+|---|---|---|
+| 0.62 | 21 | 26.1 |
+| 0.50 | 7 | 9.9 |
+| **0.40** | **0** | 4.9 |
+| 0.30 | 0 | 3.3 |
+
+At 0.62 the offset reference jumps, `path_mpc` sees `position_error=2.117 m`
+and issues "Tracking safety stop". **0.40 removes the degeneracy entirely
+and the authorized window gets slightly wider, not narrower.**
+
+## The three runs
+
+| run | outcome | log on the car |
+|---|---|---|
+| 1 | full 13.15 m lap, `allow_final=False` on all 271 samples, `obs=False` throughout | `run1_lidar_only.log` |
+| 2 | `DRIVE -> LANE_PROBE -> DRIVE`, held at 0.88 m; `allow_final=False`, `enough_dist=False` | `run2_lane_probe.log` |
+| 3 | committed to `OVERTAKE_LEFT` at 0.75 m, offset 0.62 went degenerate, tracking stop at 2.12 m | `run3_offset040.log` |
+
+## LANE_PROBE: the deployed package has DIVERGED from qcar2_side
+
+`~/qcar_v2v_ws` has `PROBE = "LANE_PROBE"` in `overtake_state_machine.py`.
+**That state does not exist in the `qcar2_side` repo**, which has only
+DRIVE / WAIT_FOR_CLEAR / OVERTAKE_LEFT / RETURN_RIGHT / EMERGENCY_STOP.
+
+It is also not mine -- my `PROBE_LEFT` uses `probe_enable`, which greps 0
+on the car. So either the car was built from a branch we do not have, or
+there is unpushed work.
+
+**Consequence: the `PROBE_LEFT` work on `feat/dhocbf-v2v` duplicates
+functionality already on the vehicle.** Reconcile before continuing the LP
+plan -- get whatever branch the car was built from first.
+
+## What is on the car now (all additive, nothing overwritten)
+
+- `~/qcar_v2v_ws/src/qcar_science_night_pkg/launch/science_night_shared.launch.py`
+  -- the stock launch plus `trajectory_file`, `map_file`,
+  `require_amcl_quality:=False`, `loop_path:=False`, `target_laps:=1`,
+  `overtake_offset_m:=0.40`, `max_speed` arg. Launch it **by path**; it is
+  not symlinked into `install/`.
+- `~/qcar_v2v_ws/start_stack.sh` / `stop_stack.sh`. **`stop_stack.sh` kills
+  by process group matched on `science_night[a-z_]*\.launch\.py`** -- it
+  must match every variant or duplicates survive. Never `pkill -f` from an
+  ssh session; it matches the session.
+- `~/qcar_v2v_ws/mapping_output/my_route_single_lap.npy` (263 pts, fails
+  the loop seam) and `my_route_lap_slice.npy` (`R[150:413]`, 263 pts,
+  uniform 0.05 spacing, **no artificial seam**, 0 ambiguous waypoints,
+  validation ok).
+- `~/qcar_v2v_ws/overtake_monitor.py` -- read-only gate diagnoser.
+
+> `nohup setsid ... &` inside an ssh command dies when the session closes.
+> Keep the session alive with a `sleep` in the same command.
+
+## Where the vehicles ended up
+
+QCar at map (+0.516,-3.728) yaw +88.5 deg: **0.52 m off the route and
+63.2 deg off its heading**, nearest lap waypoint 143. ROSbot ~0.50 m ahead
+along the route (wp ~153) -- already inside the 0.70 m emergency box.
+All four curvature gates fail there (nominal 0.98/0.51, offset 1.60/0.61).
+A pass from that spot is geometrically impossible, not a tuning problem.
+
+## Recommendation
+
+**Record a dedicated straight route, 5-6 m, for overtake testing.** On a
+straight, curvature ~0 means every waypoint authorizes a pass, the 2.75 m
+manoeuvre fits with margin, and hand placement stops being critical -- the
+current target is a ~0.3 m window for two hand-placed robots. Roughly ten
+minutes with `trajectory_recorder`. Everything already proven carries over
+unchanged: collar, detection, shared map, curve-corridor fix, launch config.
