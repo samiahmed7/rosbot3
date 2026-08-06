@@ -44,7 +44,8 @@ class Trajectory:
         self.segments: List[Segment] = []
         self.current_segment_idx: int = 0
         self.current_wp_idx: int = 0
-        
+        self._search_anchor: int = 0
+
         self._load(filepath)
         self._detect_segments()
     
@@ -195,29 +196,49 @@ class Trajectory:
         """Reset to start of trajectory."""
         self.current_segment_idx = 0
         self.current_wp_idx = 0
-    
+        self._search_anchor = 0
+
     def advance_segment(self):
         """Move to next segment."""
         if self.current_segment_idx < len(self.segments):
             self.current_segment_idx += 1
             if self.current_segment_idx < len(self.segments):
                 self.current_wp_idx = self.segments[self.current_segment_idx].start_idx
-    
+                self._search_anchor = self.current_wp_idx
+
+    # Search window for find_closest_waypoint, in waypoints (0.05 m spacing).
+    SEARCH_BACK = 20    # 1.0 m — absorbs AMCL jitter and a stalled robot
+    SEARCH_FWD = 100    # 5.0 m — enough to re-acquire after an overtake detour
+
     def find_closest_waypoint(self, x: float, y: float) -> int:
-        """Find closest waypoint to robot within current segment."""
+        """Find closest waypoint to robot, searching near the last match.
+
+        A recorded loop passes close to itself, so a global argmin over the
+        whole segment can snap to a branch the robot is not on: on the QCar's
+        route (three 13.15 m laps) 97% of waypoints had a non-adjacent
+        waypoint within 0.60 m, and the lookahead index jumped between laps
+        mid-drive. Even a single lap closes on itself at the start/finish
+        line. Anchoring the search to where we already were keeps progress
+        monotonic. The anchor advances on its own, so unlike current_wp_idx
+        it cannot freeze when the robot drifts off the route.
+        """
         seg = self.current_segment
         if not seg:
             return 0
-        
+
+        lo = max(seg.start_idx, self._search_anchor - self.SEARCH_BACK)
+        hi = min(seg.end_idx, self._search_anchor + self.SEARCH_FWD)
+
         min_dist = float('inf')
-        closest_idx = seg.start_idx
-        
-        for i in range(seg.start_idx, seg.end_idx + 1):
+        closest_idx = lo
+
+        for i in range(lo, hi + 1):
             dist = self.waypoints[i].distance_to(x, y)
             if dist < min_dist:
                 min_dist = dist
                 closest_idx = i
-        
+
+        self._search_anchor = closest_idx
         return closest_idx
 
     def advance_waypoint(self, x: float, y: float, tolerance: float = 0.12) -> bool:
@@ -238,11 +259,19 @@ class Trajectory:
         return advanced
     
     def reached_segment_goal(self, x: float, y: float, tolerance: float = 0.15) -> bool:
-        """Check if robot has reached current segment's goal."""
+        """Check if robot has reached current segment's goal.
+
+        On a closed route the goal sits next to the start (0.08 m apart on the
+        QCar's lap), which is inside the tolerance before the robot has driven
+        anywhere. Require it to have actually travelled to the far end first.
+        """
         goal = self.segment_goal
-        if goal:
-            return goal.distance_to(x, y) < tolerance
-        return False
+        if not goal:
+            return False
+        seg = self.current_segment
+        if seg and self._search_anchor < seg.end_idx - self.SEARCH_BACK:
+            return False
+        return goal.distance_to(x, y) < tolerance
     
     def distance_to_segment_goal(self, x: float, y: float) -> float:
         """Distance from position to current segment's goal."""
