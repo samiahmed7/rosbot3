@@ -1350,3 +1350,66 @@ manoeuvre fits with margin, and hand placement stops being critical -- the
 current target is a ~0.3 m window for two hand-placed robots. Roughly ten
 minutes with `trajectory_recorder`. Everything already proven carries over
 unchanged: collar, detection, shared map, curve-corridor fix, launch config.
+
+## CORRECTION: the documented software E-stop never worked (2026-08-07)
+
+`PROMPT.md` and this file both recorded **`pkill -x lidar_overtake`** as the
+software stop. **It matches nothing and has never stopped the car.**
+
+The console script is `#!/usr/bin/python3`, so the kernel execs
+`/usr/bin/python3` with the script as argv[1] and the process `comm` is
+**`python3`**. `pkill -x` matches on `comm`, so `-x lidar_overtake` cannot
+match any ROS 2 Python node. Verified on the car: `comm` reads `python3`.
+
+**What actually works**, in order:
+
+1. **Physical E-stop.** Always primary.
+2. Typed *on the car*: `pkill -f qcar_science_night_pkg` -- kills `path_mpc`,
+   the only publisher on `/cmd_vel_nav`, and `nav2_qcar2_converter` then
+   forces a stop within 0.25 s on its own timeout ("/cmd_vel_nav command
+   timed out after 0.250 seconds; forcing stop").
+3. `~/qcar_v2v_ws/stop_stack.sh` -- full teardown, matches process *groups*
+   by launch-file name. Verified four times on 2026-08-07.
+
+> **Never `pkill -f` from an ssh command.** `ssh host "pkill -f pattern"`
+> puts the pattern in the remote shell's own cmdline, so it kills the
+> session before the nodes. Typed interactively it is safe, because an
+> interactive shell's cmdline is just `-bash`. This has bitten twice.
+
+Still true: `ros2 topic pub /motion_enable false` does not stop the car,
+because `lidar_overtake` republishes `motion=True` every cycle.
+
+## Also closed: frame_tx/ty/tyaw is already identity
+
+`~/qcar_v2v_ws/src/qcar_science_night_pkg/config/v2v_params.yaml` reads
+`frame_tx: 0.0, frame_ty: 0.0, frame_tyaw: 0.0`. Correct for the shared
+map; the pending item to set it is done.
+
+## V2V: one launch flag now drives both halves
+
+`science_night_shared.launch.py` gained `v2v:=false` (default), which sets
+`path_mpc`'s `enable_v2v` **and** `lidar_overtake`'s `v2v_fusion_enable`
+together. The node's own comment is the reason: fusion is the half that
+STARTS a pass, `enable_v2v` is the DCBF keep-out and speed governor that
+make it safe, and both `science_night` launch files ship with neither set.
+Enabling fusion alone gives V2V-initiated passes with no barrier behind
+them.
+
+    ros2 launch ~/qcar_v2v_ws/src/qcar_science_night_pkg/launch/\
+science_night_shared.launch.py max_speed:=0.20 v2v:=true
+
+## The LANE_PROBE deadlock is documented in the deployed source
+
+`lidar_overtake_node.py`'s comment at `probe_min_gap_m` describes exactly
+what run 2 hit: the probe's default 0.50 m gap against a 1.20 m
+`overtake_start_min_distance_m` means an obstacle declared at 1.45 m puts
+the car in LANE_PROBE, the probe walks it in to 0.70 m, and the pass gate
+then refuses forever because 0.70 < 1.20 -- logged as
+`allow_raw=True | enough_dist=False` with progress frozen. The deployed
+default is now `probe_min_gap_m: 0.0` ("derive it"), but a car already
+driven inside 1.20 m still cannot commit.
+
+**Consequence for V2V on the tight circuit:** enabling V2V adds the speed
+governor (hard stop at `v2v_stop_gap` 0.70 m), which drives the car into
+exactly that region. V2V makes a pass *less* likely here, not more. Run it
+to validate the link, not to get an overtake.
