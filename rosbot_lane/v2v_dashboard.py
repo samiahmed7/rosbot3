@@ -58,6 +58,28 @@ ROLES = {
     },
 }
 
+# The ROSbot runs web_video_server on its own board (192.168.0.110), which is
+# a different machine from rosbot-server (192.168.0.100) where this script
+# runs. Taking the feed straight from there costs nothing on rosbot-server and
+# works even when this dashboard's own ROS graph is down.
+#
+# Must be /stream, not /stream_viewer: stream_viewer returns text/html (a page
+# wrapping the feed) and will not render inside an <img>, while /stream is the
+# multipart/x-mixed-replace MJPEG the tag needs.
+#
+# The quality/width/height parameters are not cosmetic. Unthrottled this feed
+# is 640x400 at 20 Hz and measured **21 Mbps** on the wire; both dashboards
+# embed it, so with a browser tab open that is three concurrent copies over
+# WiFi. web_video_server wedged under exactly that load -- port 8081 still
+# accepted TCP but never answered, while the camera topic itself stayed
+# healthy at 20 Hz. Downscaling costs nothing worth having on a monitoring
+# view and keeps the link inside its budget.
+ROSBOT3_CAMERA_URL = (
+    "http://192.168.0.110:8081/stream"
+    "?topic=/rosbot3/oak/rgb/image_raw"
+    "&type=mjpeg&quality=35&width=424&height=240"
+)
+
 
 def to_bgr(msg):
     """Decode common sensor_msgs/Image encodings into a BGR array.
@@ -496,6 +518,10 @@ def main():
                      help="IP of the OTHER robot running this same script")
     ap.add_argument("--peer-port", type=int, default=None,
                      help="defaults to --port (peer runs on the same port)")
+    ap.add_argument("--rosbot3-camera-url", default=ROSBOT3_CAMERA_URL,
+                     help="ROSbot 3 camera MJPEG URL (web_video_server on the "
+                          "robot itself); pass '' to use this dashboard's own "
+                          "/stream instead")
     args = ap.parse_args()
 
     if cv2 is None:
@@ -514,6 +540,11 @@ def main():
         qcar2_cam_src, rosbot3_cam_src = my_cam_src, peer_cam_src
     else:
         qcar2_cam_src, rosbot3_cam_src = peer_cam_src, my_cam_src
+
+    # web_video_server on the robot serves the ROSbot camera directly, so both
+    # instances point at the same place and neither has to relay it.
+    if args.rosbot3_camera_url:
+        rosbot3_cam_src = args.rosbot3_camera_url
 
     page_html = (
         PAGE_TEMPLATE

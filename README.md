@@ -292,3 +292,17 @@ Notes:
 - Camera topics default to `/camera/color_image` (QCar 2) and
   `/rosbot3/oak/rgb/image_raw` (ROSbot 3); override with `--camera-topic`
   if either ever changes.
+- **The ROSbot 3 camera panel comes from `web_video_server` on the robot
+  itself**, `http://192.168.0.110:8081/stream?topic=/rosbot3/oak/rgb/image_raw`,
+  not from this dashboard. Note 192.168.0.110 is the ROSbot's own board —
+  a *different machine* from rosbot-server at 192.168.0.100 where this
+  script runs. Both dashboard instances point at it, so neither relays the
+  feed and it keeps working even if this dashboard's ROS graph is down.
+  Override with `--rosbot3-camera-url`, or pass `''` to fall back to this
+  dashboard's own `/stream`.
+
+  > It must be `/stream`, not `/stream_viewer`. `stream_viewer` returns
+  > `text/html` — a page wrapping the feed — which will not render inside
+  > an `<img>`. `/stream` returns the `multipart/x-mixed-replace` MJPEG the
+  > tag needs. Browsing to `http://192.168.0.110:8081/` lists the topics it
+  > is serving.
