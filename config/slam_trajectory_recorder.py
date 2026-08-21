@@ -29,10 +29,15 @@ class SlamTrajectoryRecorderNode(Node):
         self._current_x = 0.0
         self._current_y = 0.0
         self._current_theta = 0.0
-        
-        # Last recorded pose
+
+        # Last recorded pose (map frame, for CSV output)
         self._last_recorded_x = None
         self._last_recorded_y = None
+
+        # Last recorded pose (odom frame, for movement gating - avoids
+        # false triggers from SLAM's map->odom correction jitter)
+        self._last_recorded_odom_x = None
+        self._last_recorded_odom_y = None
         
         # CSV file
         self._traj_file = open(self._trajectory_file, 'w', newline='')
@@ -54,33 +59,42 @@ class SlamTrajectoryRecorderNode(Node):
                 'base_link',
                 rclpy.time.Time()
             )
+            odom_transform = self._tf_buffer.lookup_transform(
+                'odom',
+                'base_link',
+                rclpy.time.Time()
+            )
         except Exception as e:
             self.get_logger().warn(f'TF lookup failed: {e}', throttle_duration_sec=2.0)
             return
-        
+
         # Extract position
         self._current_x = transform.transform.translation.x
         self._current_y = transform.transform.translation.y
-        
+
         # Quaternion to yaw
         q = transform.transform.rotation
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self._current_theta = math.atan2(siny_cosp, cosy_cosp)
-        
+
+        self._current_odom_x = odom_transform.transform.translation.x
+        self._current_odom_y = odom_transform.transform.translation.y
+
         self._record_position()
 
     def _record_position(self):
-        """Record position if moved enough."""
-        if self._last_recorded_x is None:
+        """Record position if moved enough, gated on odom (wheel) motion
+        so SLAM's map->odom correction jitter doesn't trigger false points."""
+        if self._last_recorded_odom_x is None:
             # First point
             self._save_point()
             return
-        
-        dx = self._current_x - self._last_recorded_x
-        dy = self._current_y - self._last_recorded_y
+
+        dx = self._current_odom_x - self._last_recorded_odom_x
+        dy = self._current_odom_y - self._last_recorded_odom_y
         dist = math.sqrt(dx*dx + dy*dy)
-        
+
         if dist >= self._min_record_distance:
             self._save_point()
 
@@ -95,6 +109,8 @@ class SlamTrajectoryRecorderNode(Node):
         
         self._last_recorded_x = self._current_x
         self._last_recorded_y = self._current_y
+        self._last_recorded_odom_x = self._current_odom_x
+        self._last_recorded_odom_y = self._current_odom_y
         self._point_count += 1
         
         self.get_logger().info(

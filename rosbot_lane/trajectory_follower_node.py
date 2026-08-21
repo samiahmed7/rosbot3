@@ -118,6 +118,7 @@ class TrajectoryFollowerNode(Node):
         self._obstacle_slow_distance = 0.90    # m — start decelerating below this
         self._obstacle_clear_distance = 0.50   # m — resume only when clearer than this (hysteresis)
         self._obstacle_paused = False           # state: currently waiting?
+        self._overtake_obstacle_paused = False  # state: holding mid-overtake?
         # Manual pause (keyboard)
         self._manual_paused = False
         self._term_old_settings = None
@@ -262,7 +263,42 @@ class TrajectoryFollowerNode(Node):
     
         # Fully clear
         return 1.0, False
-    
+
+    def _check_overtake_obstacle(self) -> tuple:
+        """Like _check_obstacle, but measures the swerved (overtake) lane instead
+        of the straight-ahead lane, with the same stop/slow/clear distance
+        thresholds. Used to hold mid-overtake only when something is genuinely
+        close in the lane the robot is actually driving in — unlike
+        _is_overtake_feasible(), which has no distance threshold and treats any
+        detection in its full planning window (e.g. a wall 1.8m away) as blocked,
+        making it unusable as a continuous in-progress check."""
+        half_lane = self._lane_width / 2.0
+        offset = self._overtake_lateral_offset
+        dist = self._closest_in_region(
+            self._latest_scan,
+            x_min=-0.2, x_max=self._lane_max_lookahead,
+            y_min=offset - half_lane, y_max=offset + half_lane,
+        )
+
+        if self._overtake_obstacle_paused:
+            if dist > self._obstacle_clear_distance:
+                self._overtake_obstacle_paused = False
+                self.get_logger().info(f'Overtake lane clear (dist={dist:.2f}m) — resuming')
+                return 1.0, False
+            return 0.0, True
+
+        if dist < self._obstacle_stop_distance:
+            self._overtake_obstacle_paused = True
+            self.get_logger().info(f'Overtake lane blocked at {dist:.2f}m — pausing until clear')
+            return 0.0, True
+
+        if dist < self._obstacle_slow_distance:
+            band = self._obstacle_slow_distance - self._obstacle_stop_distance
+            scale = (dist - self._obstacle_stop_distance) / band
+            return scale, False
+
+        return 1.0, False
+
     def _is_overtake_feasible(self) -> bool:
         """Is the left lane (overtake corridor) clear of LIDAR points?"""
         if self._latest_scan is None:
@@ -540,8 +576,15 @@ class TrajectoryFollowerNode(Node):
                 )
                 return
 
-        # Check if we reached the segment goal
-        if self._trajectory.reached_segment_goal(self._x, self._y, self._segment_goal_tolerance):
+        # Check if we reached the segment goal. Requires real progress through the
+        # segment first (>=50% of its waypoints) — a closed-loop recording's last
+        # waypoint can land within tolerance of its own first waypoint (e.g. the
+        # recorder overran the start slightly when stopping), which would otherwise
+        # make the goal check pass on tick one, before any driving happens.
+        seg_progress = self._trajectory.current_wp_idx - seg.start_idx
+        seg_length = seg.end_idx - seg.start_idx
+        min_progress = max(5, seg_length // 2)
+        if seg_progress >= min_progress and self._trajectory.reached_segment_goal(self._x, self._y, self._segment_goal_tolerance):
             self._stop()
             self._trajectory.advance_segment()
 
@@ -671,27 +714,35 @@ class TrajectoryFollowerNode(Node):
             self._overtake_path = []
             self._state = State.FOLLOWING_SEGMENT
             self._slowdown_timer = 0.0
+            self._overtake_obstacle_paused = False
             return
 
-        # Obstacle ahead mid-overtake — hold position, keep the detour intact,
-        # resume the SAME path once clear (no re-trigger, no new detour)
-        obstacle_scale, should_stop = self._check_obstacle()
+        # Obstacle in the swerved (overtake) lane — hold position, keep the detour
+        # intact, resume the SAME path once clear (no re-trigger, no new detour).
+        # NOTE: must check the overtake lane here, not the straight-ahead lane —
+        # the robot is still pointed at the original obstacle for the first tick
+        # or two of the maneuver, so a straight-ahead check trips immediately and
+        # can never clear (the robot can't move away while _stop()ped). Also must
+        # use distance thresholds (not _is_overtake_feasible(), which has none) —
+        # otherwise anything in the 2m planning window, even a distant wall, holds
+        # the robot forever since it can't move to change the reading.
+        obstacle_scale, should_stop = self._check_overtake_obstacle()
         if should_stop:
             self._stop()
             self.get_logger().info(
-                '[OVERTAKE] Obstacle ahead — holding position',
+                '[OVERTAKE] Obstacle in overtake lane — holding position',
                 throttle_duration_sec=1.0
             )
             return
 
         # Drive to lookahead point on the detour
         la_x, la_y = self._lookahead_on_detour(self._lookahead_forward)
-        
+
         linear, angular, _, heading_error, _ = self._controller.compute_control(
             self._x, self._y, self._theta,
             la_x, la_y,
             is_reverse=False,
-            speed_factor=obstacle_scale,   # was 1.0 — now ramps down approaching an obstacle too
+            speed_factor=obstacle_scale,
         )
         self._publish_cmd(linear, angular)
         
