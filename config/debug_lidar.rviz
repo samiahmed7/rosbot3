@@ -1,0 +1,59 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+    - Class: rviz_default_plugins/Map
+      Name: Map
+      Topic:
+        Value: /map
+      Enabled: true
+    - Class: rviz_default_plugins/LaserScan
+      Name: LaserScan
+      Topic:
+        Value: /rosbot3/scan
+        Depth: 20
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+      Size (m): 0.05
+      Color: 255; 0; 0
+      Decay Time: 0
+      Enabled: true
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+    - Class: rviz_default_plugins/PoseWithCovariance
+      Name: AMCL Pose
+      Topic:
+        Value: /amcl_pose
+      Enabled: true
+    - Class: rviz_default_plugins/Path
+      Name: Recorded Trajectory
+      Topic:
+        Value: /trajectory_path
+        Durability Policy: Transient Local
+      Color: 0; 170; 255
+      Line Style: Lines
+      Line Width: 0.03
+      Enabled: true
+  Global Options:
+    Fixed Frame: map
+    Background Color: 48; 48; 48
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      Scale: 40
+      X: 1.5
+      Y: 1.0
+      Target Frame: <Fixed Frame>
+Window Geometry:
+  Height: 900
+  Width: 1200

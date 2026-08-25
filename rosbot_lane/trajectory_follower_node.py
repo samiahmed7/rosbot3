@@ -430,13 +430,27 @@ class TrajectoryFollowerNode(Node):
 
     def _handle_complete(self):
         """Lap finished — reset per-lap state and loop back to the start."""
-        self._stop()
         self.get_logger().info('=== LAP COMPLETE — restarting ===')
         self._pause_triggered = set()
         self._pause_active_idx = None
         self._pause_start_time = None
         self._overtake_path = []
         self._slowdown_timer = 0.0
+
+        # If the loop closes cleanly (already at the start, already facing the
+        # recorded start heading), skip the stop/rotate/align dance entirely
+        # and flow straight into the next lap for a seamless transition.
+        start = self._trajectory.start
+        dist = math.hypot(start.x - self._x, start.y - self._y)
+        heading_error = abs(self._normalize_angle(start.theta - self._theta))
+        if dist < self._start_pos_tolerance and heading_error < self._controller.cfg.angle_tolerance:
+            self._trajectory.reset()
+            self._state = State.FOLLOWING_SEGMENT
+            seg = self._trajectory.current_segment
+            self.get_logger().info(f'Loop closed cleanly — continuing into {seg} (no realign)')
+            return
+
+        self._stop()
         self._state = State.WAITING_FOR_LOCALIZATION
 
     def _handle_rotate_to_start(self):
