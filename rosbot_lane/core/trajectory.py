@@ -270,9 +270,18 @@ class Trajectory:
         seg = self.current_segment
         if not seg:
             return 0, self.waypoints[0]
-        
-        closest_idx = self.find_closest_waypoint(x, y)
-        
+
+        # Search for the closest point in a small window around current_wp_idx,
+        # not the whole segment — a full-segment nearest-neighbor search can jump
+        # to a spatially-close-but-far-along-the-path index where a closed loop
+        # nearly touches itself (e.g. right after loop-closure reset, the last
+        # waypoint sits right next to the first), producing a near-zero-distance
+        # lookahead target and an unstable steering command.
+        window = 15
+        lo = max(seg.start_idx, self.current_wp_idx - window)
+        hi = min(seg.end_idx, self.current_wp_idx + window)
+        closest_idx = min(range(lo, hi + 1), key=lambda i: self.waypoints[i].distance_to(x, y))
+
         cumulative = 0.0
         for i in range(closest_idx, seg.end_idx):
             wp_curr = self.waypoints[i]

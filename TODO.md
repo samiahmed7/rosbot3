@@ -1,5 +1,208 @@
 # TODO / Future Work
 
+## HIGH PRIORITY — QCar 2 lane filtering + overtake abort (deadline 2026-08-30)
+
+**Added 2026-08-28** after a supervisor meeting. Two working days. Everything
+in this section happens in **`~/ros2_ws_sami`** on QCar 2 (`ros2_ws_izhan` is
+the untouched clean fallback — verified byte-different, keep it that way).
+
+**Supervisor's ask, verbatim intent:** implement the *lane filtering* scenario
+from the IDEAM paper on QCar 2, and have it check ROSbot 3's location from the
+V2V link at the same time. He demonstrated the current failure himself: he
+stood in the second lane while QCar 2 was in the overtaking state, and the car
+**stopped** rather than returning to its original lane, even though that lane
+was clear.
+
+**Strategy decision: extend the existing stack, do NOT reimplement IDEAM from
+scratch.** Rationale in "Explicitly out of scope" below. A from-scratch
+reconstruction is a 2-3 week job; the existing stack already carries weeks of
+hard-won tuning (Issues 14/15/16, `v_curve_min`, track-error limiting, startup
+ramp) plus all of the 2026-08-27/28 fixes, and throwing that away two days
+before a deadline is the wrong trade.
+
+---
+
+### BLOCKERS — resolve before building anything on top of the V2V gap
+
+- [ ] **B1. The V2V gap number is wrong by roughly 2x, cause unknown.**
+      Measured on hardware 2026-08-28: dashboard/`/v2v/gap` read **1.051 m**
+      while a tape measure between chassis read **57 cm** (~1.84x). This is
+      *the* blocker: the supervisor explicitly wants the V2V location check,
+      and gap-magnitude filtering (D1 below) is built directly on this number.
+      A filter fed a 2x-wrong distance makes confidently wrong decisions.
+      Already ruled out, do not re-investigate:
+    - **Not a curvature/arc-length artifact.** Verified the reference path is
+      effectively straight between the two indices involved — chord distance
+      and along-path distance agreed to 3 decimal places (1.051 m both ways).
+    - **Not a stale-recording mismatch.** ROSbot 3's trajectory (Aug 25) and
+      the calibration (Aug 26) are chronologically consistent; QCar 2's
+      `track_map_new.pbstream` / `track_run_cartographer_final.npy` (Aug 17-18)
+      were untouched by the 2026-08-27/28 cartographer retuning, which only
+      changed matching thresholds, not the frozen map.
+    - **Not QCar 2's own localization.** User confirmed live that QCar 2's
+      position on its own dashboard track matches where it physically is.
+    - **Next diagnostic step (~15 min, do this first):** does ROSbot 3's own
+      dashboard show *its* position matching where it physically is? That one
+      check isolates ROSbot 3's AMCL from the `frame_tx/ty/tyaw` calibration
+      (currently `1.3814 / 0.4986 / -3.030697`, ICP-derived 2026-08-26 at
+      4.7 cm RMS — see `memory/v2v-map-frame-calibration.md`). Note 4.7 cm RMS
+      alone cannot explain a 48 cm error, so if ROSbot 3's own position checks
+      out too, the calibration becomes the prime remaining suspect and should
+      be re-derived by loop-to-loop ICP.
+
+- [ ] **B2. Along-path gap is structurally blind to lateral offset — known,
+      affects design not correctness.** A *second*, separate discrepancy was
+      seen during an actual pass: `/v2v/gap` 0.661 m vs 19 cm physical
+      (~3.48x). This one **is** explained: `signed_gap_along()` measures
+      progress along the centerline only, so during a 0.70 m lateral swerve
+      two vehicles can be nearly touching while the along-path number still
+      looks comfortable. Do **not** use `/v2v/gap` as a proximity check during
+      the pass itself — use the LiDAR side sectors (`right_min`/`right_count`)
+      for lateral clearance. Different mechanism from B1; fixing B1 will not
+      fix this.
+
+- [ ] **B3. `path_mpc` has no staleness watchdog on `/v2v/follow_speed_cap`.**
+      If `v2v_receiver` dies (it crashed once on 2026-08-28), the last cap
+      value freezes in place indefinitely instead of falling back to "no
+      restriction". The crash itself is fixed, but the missing watchdog is
+      not. Low effort, worth doing before relying on V2V for decisions.
+
+---
+
+### THE BUG THE SUPERVISOR DEMOED (highest value, ~10 lines)
+
+- [x] **A1. Add an abort-to-return path to the overtake state machine.**
+      **WRITTEN + BUILT 2026-08-28 into `ros2_ws_sami` — NOT yet hardware-tested.**
+      Overtake lane blocked + original lane empty (`right_clear and
+      right_count == 0`) now transitions to `RETURN` instead of `WAIT`;
+      `WAIT` is reserved for when both lanes are blocked. Deliberately not
+      gated on `min_overtake_steps` or `sufficient_lead_to_return` (an abort
+      is an escape, not a completed pass), nor on the 3-tick
+      `confirmed_right_clear` counter — falling through to `WAIT` would trap
+      the car, since `WAIT` cannot re-enter `OVERTAKE` while the left lane
+      is still blocked. Added `last_return_was_abort` + an `abort_return=`
+      field in the `lidar_overtake` log so an abort is distinguishable from
+      a normal completion. Verified offline against the supervisor's exact
+      scenario (4 cases incl. a regression that normal passes still work).
+      **To test:** stand in the overtake lane mid-pass — expect
+      `state=RETURN_RIGHT`, `offset=0.00`, `motion=True`, `abort_return=True`
+      instead of a stop.
+      In `src/qcar_science_night_pkg/qcar_science_night_pkg/overtake_state_machine.py`,
+      the `OVERTAKE` branch currently has exactly one escape when the overtake
+      lane becomes blocked:
+
+      ```python
+      if not status.left_clear and status.left_count > 0:
+          self.state = self.WAIT
+          return OvertakeDecision(self.state, 999.0, False)   # full stop
+      ```
+
+      There is no path anywhere in the machine that goes "overtake lane
+      blocked + original lane clear -> return to original lane". `WAIT` is a
+      hard stop (offset 999.0 sentinel, `motion_enabled=False`), regardless of
+      how clear the lane it came from is. **Confirmed pre-existing** in the
+      upstream `izhan` branch — this is not a regression from the 2026-08-27/28
+      work.
+    - Fix: overtake lane blocked **and** original lane clear -> `RETURN`.
+      Reserve `WAIT` for when *both* lanes are blocked.
+    - Reuse the existing `right_clear` / `right_count` confirm-counters for
+      the "original lane is clear" test rather than inventing a new signal.
+    - **Framing worth using in the write-up:** the paper's whole argument is
+      that a passive safety mode is inferior to active probing — the ego
+      should *"proactively explore opportunities for merging"* rather than
+      *"merely adopting a passive safety mode in response to the environment"*
+      (Sec. V-A-2). The current `WAIT_FOR_CLEAR` hard-stop **is** the passive
+      baseline the paper argues against. The supervisor demonstrated the
+      paper's own motivating problem on our robot — say so explicitly.
+
+---
+
+### WHAT MAPS CLEANLY FROM IDEAM (build these)
+
+| Paper concept | Our stack today | Work needed |
+|---|---|---|
+| **LK** (lane-keeping, Eq. 31) | `DRIVE` | exists, rename only |
+| **LP** (lane-probing, Eq. 32) | *missing* — we jump straight to full commit or full stop | the real gap, see D2 |
+| **LC** (lane-changing, Eq. 33) | `OVERTAKE_LEFT` / `RETURN_RIGHT` | exists, rename only |
+| **Gap Magnitude Judge** (Alg. 2 line 6 — filter candidate gaps lacking space) | partial: `enough_distance_to_overtake` | extend with V2V, see D1 |
+
+- [ ] **D1. Gap-magnitude filtering using the V2V location (the supervisor's
+      "lane filtering").** Make the candidate-gap evaluation an explicit,
+      named filter step rather than the current inline boolean: evaluate the
+      target-lane gap, filter it out if it lacks sufficient space, and let the
+      decision fall through to an alternative (probe / abort / return) instead
+      of collapsing to a stop. Feed it the V2V gap **and** the LiDAR side
+      sectors, per B2. Blocked by B1.
+- [ ] **D2. Explicit LP (lane-probing) state between `DRIVE` and
+      `OVERTAKE_LEFT`.** Probe alongside, evaluate the gap, then commit or
+      abort — instead of today's binary commit-or-stop. Note the follow law
+      (`cap = leader_speed + gain*(gap - target)`) is already a crude LP: it
+      holds station behind ROSbot 3. What's missing is the explicit state, the
+      filtering, and the abort path (A1).
+- [ ] **D3. Rename states to LK / LP / LC** so the implementation reads as an
+      IDEAM reconstruction rather than an ad-hoc FSM. Cheap, and it is what
+      makes the deliverable legible to the supervisor.
+
+---
+
+### TWO-DAY PLAN
+
+Estimated ~1.5 days of work, leaving real buffer. Hardware integration is
+where time actually goes — 2026-08-27/28 is the evidence.
+
+- [ ] **Step 0 — B1 diagnostic (~15 min).** Check ROSbot 3's own dashboard
+      position against physical. Everything else that touches the gap number
+      depends on this.
+- [ ] **Step 1 — A1 abort-to-return (~1-2 h incl. hardware test).** Fixes the
+      exact scenario the supervisor demonstrated. Do this first even if B1
+      drags — it is independent of gap accuracy.
+- [ ] **Step 2 — D1 gap-magnitude filtering (~3-4 h).** Blocked by B1.
+- [ ] **Step 3 — D2 explicit LP state (~4-5 h).**
+- [ ] **Step 4 — Hardware integration + tuning (~4-6 h).** Budget generously.
+- [ ] **Step 5 — Write-up + before/after video of the supervisor's exact
+      scenario (~2 h).** Map our LK/LP/LC states to the paper's Eqs. 31-33,
+      state the disclosed deviations (below) plainly rather than hiding them.
+
+**Deployment reminder for every step:** `lidar_overtake` and `v2v_receiver`
+are started once in `launch_stack()` and are **not** restarted by the script's
+relaunch (`l`) — a `colcon build` alone does nothing to the running process.
+Kill and relaunch manually (`pkill -2 -f "qcar_science_night_pkg/<node>"`,
+then `ros2 run ...`), which can be done live without disrupting driving.
+Non-interactive SSH also needs `source install/setup.bash` on top of
+`/opt/ros/humble/setup.bash`.
+
+---
+
+### EXPLICITLY OUT OF SCOPE (disclose as deviations, do not attempt in 2 days)
+
+- **LSGM / C-DFS graph search (Alg. 1-2, Fig. 4-5).** Needs six vehicle
+  groups (L1,L2,C1,C2,R1,R2) in dense multi-lane traffic. We have *one* other
+  robot. `LevelCheck` and `RiskAssessment` over a two-node graph is theater,
+  not function. (Note this contradicts the more optimistic 2-lane/4-node
+  assessment in the older "PAPER Implementation" section further down this
+  file — that assessment assumed more surrounding traffic than we actually
+  run.)
+- **DCBF/DHOCBF convex-QP motion planner (Eqs. 14-19, 25-33).** Replacing the
+  existing CasADi NLP wholesale, then re-tuning on hardware. Weeks, not days.
+- **Paper's parameter set (Tables I-II).** Paper is a 3.5 m car at 18 m/s with
+  `d_0=5 m`, `d_lat=2.1 m`, `l_diag=3.7 m`. QCar 2 is ~0.4 m at 0.75 m/s.
+  Every value needs re-derivation; none transfer directly.
+
+---
+
+### CONFIRM WITH SUPERVISOR BEFORE BUILDING
+
+- [ ] **"Lane filtering" is not verbatim paper terminology.** Best reading is
+      the **Gap Magnitude Judgement** step (Alg. 2 line 6; "Filtered nodes" in
+      Fig. 1) — filtering candidate lane-gaps that lack sufficient space.
+      That reading fits both halves of his instruction (filtering + the V2V
+      location check) and explains the failure he demonstrated. But it could
+      also mean motorcycle-style lane filtering, which is a completely
+      different behaviour. **One message before building — it changes the
+      deliverable.**
+
+---
+
 ## Next major feature: V2V communication with Quanser QCar 2
 
 **Goal:** ROSbot 3 and a Quanser QCar 2 (a different vendor's platform — a
@@ -398,6 +601,21 @@ ros2 topic echo /v2v/alive
       story (round 1 was against the wrong QCar 2 workspace; round 2
       against the correct `~/qcar_v2v_ws` worked, 3.7cm residual).
 - [x] **Map-frame alignment between the two robots — DONE 2026-08-05.**
+      > **SUPERSEDED 2026-08-26 — DO NOT USE THE VALUES BELOW.** The
+      > landmark-transform result in this item was replaced by a
+      > loop-to-loop ICP solve (4.7 cm RMS). The transform **actually
+      > live on QCar 2** — verified on the robot 2026-08-28 in *both*
+      > `ros2_ws_izhan` and `ros2_ws_sami` — is:
+      > `frame_tx=1.3814, frame_ty=0.4986, frame_tyaw=-3.030697`.
+      > See `memory/v2v-map-frame-calibration.md`, and the local copy at
+      > `qcar2/src/qcar_science_night_pkg/config/v2v_params.yaml`.
+      > Restoring the old numbers below would silently break `gap`/`on_path`.
+      > Note also that the two-landmark method itself was **abandoned as
+      > inconsistent** (P1->P2 measured 4.370 m in ROSbot 3's map vs
+      > 3.460 m in QCar 2's — impossible for a rigid transform); the
+      > `?` left in `~/Desktop/v2v_calibration/landmark_measurements_INCONSISTENT.txt`
+      > is a dead end, not outstanding work.
+
       Decision made 2026-08-04: going with the landmark-transform
       approach, not switching to a shared map. Result:
       `frame_tx=-4.679956, frame_ty=-3.745196, frame_tyaw=-0.705757`,

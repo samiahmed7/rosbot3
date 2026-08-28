@@ -28,6 +28,7 @@ network only, same caveat as camera_web_view.py.
 
 import argparse
 import json
+import math
 import socket
 import threading
 import time
@@ -39,7 +40,10 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, Float32, String
-from geometry_msgs.msg import PoseStamped
+from tf2_ros import Buffer, TransformListener
+from geometry_msgs.msg import (
+    PoseStamped,
+)
 
 try:
     import cv2
@@ -97,10 +101,26 @@ def to_bgr(msg):
 
 class Dashboard(Node):
 
-    def __init__(self, role, camera_topic, quality):
+    def __init__(self, role, camera_topic, quality, trajectory=None):
         super().__init__("v2v_dashboard")
         self.role = role
         self.quality = int(quality)
+        self._map_lock = threading.Lock()
+        self._own_xy = None
+        self._own_prev = None
+        self._own_speed = 0.0
+        self._peer_xy = None
+        self._track = None
+        self._load_track(trajectory)
+        # Own-pose polling (for the live track map) is role-independent —
+        # both robots run their own localization and can report their own
+        # position via TF. Previously this was only wired for role=qcar2,
+        # so ROSbot3's dashboard had nothing to render locally and always
+        # depended on fetching QCar2's /trackmap.png cross-machine — which
+        # showed nothing at all whenever QCar2's stack wasn't running.
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
+        self.create_timer(0.2, self._poll_own_pose)
         self.frames = 0
         self.frame_errors = 0
         self._jpeg = None
@@ -211,6 +231,39 @@ class Dashboard(Node):
             lambda m: self._set("motion_enable", bool(m.data)), 10
         )
 
+    def _poll_own_pose(self):
+        try:
+            t = self._tf_buffer.lookup_transform(
+                "map", "base_link", rclpy.time.Time()
+            )
+        except Exception:
+            return
+        xy = (t.transform.translation.x, t.transform.translation.y)
+        with self._map_lock:
+            self._own_xy = xy
+
+        if self.role != "qcar2":
+            # ROSbot3 already has a more accurate my_speed from the
+            # broadcaster's own odometry (_on_stats_json below) -- this
+            # TF-delta estimate would just be a noisier competing source
+            # for the same key.
+            return
+
+        now = time.monotonic()
+        # Speed from pose deltas rather than a command topic: the QCar's MPC
+        # reaches the motors by a route that leaves /cmd_vel_nav at zero, so
+        # measuring the actual movement is what reliably drives the badge.
+        prev = self._own_prev
+        if prev is not None:
+            dt = now - prev[2]
+            if dt > 0.1:
+                v = math.hypot(xy[0] - prev[0], xy[1] - prev[1]) / dt
+                self._own_speed = 0.6 * self._own_speed + 0.4 * v
+                self._set("my_speed", round(self._own_speed, 3))
+                self._own_prev = (xy[0], xy[1], now)
+        else:
+            self._own_prev = (xy[0], xy[1], now)
+
     def _on_stats_json(self, msg):
         try:
             stats = json.loads(msg.data)
@@ -218,11 +271,114 @@ class Dashboard(Node):
             return
         with self._data_lock:
             self.data.update(stats)
+            # The broadcaster reports its own measured speed as "speed";
+            # expose it under the same key the QCar side uses so one badge
+            # renderer serves both columns.
+            if "speed" in stats:
+                self.data["my_speed"] = stats["speed"]
             self.data["_updated"] = time.time()
 
     def _on_rosbot_pose(self, msg):
         self._set("rosbot_x", round(msg.pose.position.x, 3))
         self._set("rosbot_y", round(msg.pose.position.y, 3))
+        with self._map_lock:
+            self._peer_xy = (msg.pose.position.x, msg.pose.position.y)
+
+    # -- live track map ------------------------------------------------
+    def _load_track(self, path):
+        """Reference trajectory, in the same frame the poses arrive in.
+
+        Handles both native formats in use across the two robots: QCar2's
+        .npy (Nx2+) and ROSbot3's .csv (x,y,theta columns) -- this file is
+        shared between both --role invocations, so it needs to read
+        whichever trajectory format that role actually has on disk.
+        """
+        self._track = None
+        if not path:
+            return
+        try:
+            if str(path).lower().endswith(".csv"):
+                import csv as csv_mod
+                with open(path) as fh:
+                    rows = list(csv_mod.DictReader(fh))
+                self._track = np.array(
+                    [[float(r["x"]), float(r["y"])] for r in rows]
+                )
+            else:
+                self._track = np.load(path)[:, :2].astype(float)
+            self.get_logger().info(
+                f"track map: {len(self._track)} pts from {path}"
+            )
+        except Exception as e:
+            self.get_logger().warn(f"track map disabled ({path}: {e})")
+
+    def render_track_png(self, w=560, h=560, pad=28):
+        """Reference path plus both vehicles, as a PNG. Returns None when
+        there is no trajectory to draw against."""
+        if self._track is None or cv2 is None:
+            return None
+        with self._map_lock:
+            own, peer = self._own_xy, self._peer_xy
+        t = self._track
+        x0, x1 = float(t[:, 0].min()), float(t[:, 0].max())
+        y0, y1 = float(t[:, 1].min()), float(t[:, 1].max())
+        s = min((w - 2 * pad) / max(x1 - x0, 1e-6),
+                (h - 2 * pad) / max(y1 - y0, 1e-6))
+
+        if self.role == "qcar2":
+            def px(p):
+                # Rotated 180 deg from the plain map convention so the
+                # drawing matches the track as seen from where QCar2's
+                # side is actually watched.
+                return (int(w - pad - (p[0] - x0) * s),
+                        int(pad + (p[1] - y0) * s))
+        else:
+            # ROSbot3's own map frame needs the PLAIN convention, not the
+            # 180-deg-rotated one QCar2 needs -- the two robots' maps were
+            # recorded independently and don't share an orientation
+            # convention. Confirmed both ways live: QCar2 needed the
+            # rotated version, ROSbot3 needed this one (2026-08-27).
+            def px(p):
+                return (int(pad + (p[0] - x0) * s),
+                        int(h - pad - (p[1] - y0) * s))
+
+        img = np.full((h, w, 3), 18, np.uint8)
+        pts = np.array([px(p) for p in t], np.int32)
+        cv2.polylines(img, [pts], True, (200, 190, 60), 2, cv2.LINE_AA)
+        # Start of the reference path -- where the QCar must be placed and
+        # where AMCL is seeded, so it is worth showing explicitly.
+        sp = px(t[0])
+        cv2.drawMarker(img, sp, (255, 255, 255), cv2.MARKER_CROSS, 18, 2,
+                       cv2.LINE_AA)
+        cv2.circle(img, sp, 13, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(img, "START", (sp[0] + 16, sp[1] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, .45, (255, 255, 255), 1,
+                    cv2.LINE_AA)
+        # Colour/label follow robot IDENTITY, not own/peer -- QCar2 is
+        # always green and ROSbot3 always orange on either dashboard, so
+        # switching between the two pages doesn't flip what a colour
+        # means. Previously "own" was hardcoded "QCar2"/green regardless
+        # of self.role, so ROSbot3's own dot rendered mislabeled as
+        # "QCar2" on its own dashboard (found 2026-08-27).
+        ROSBOT3, QCAR2 = (40, 150, 255), (90, 230, 120)
+        own_name, own_color = (
+            ("QCar2", QCAR2) if self.role == "qcar2" else ("ROSbot3", ROSBOT3)
+        )
+        peer_name, peer_color = (
+            ("ROSbot3", ROSBOT3) if self.role == "qcar2" else ("QCar2", QCAR2)
+        )
+        if peer is not None:
+            cv2.circle(img, px(peer), 9, peer_color, -1, cv2.LINE_AA)
+            cv2.putText(img, peer_name, (px(peer)[0] + 12, px(peer)[1] + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, .45, peer_color, 1,
+                        cv2.LINE_AA)
+        if own is not None:
+            cv2.circle(img, px(own), 9, own_color, -1, cv2.LINE_AA)
+            cv2.putText(img, own_name, (px(own)[0] + 12, px(own)[1] + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, .45, own_color, 1,
+                        cv2.LINE_AA)
+        ok, buf = cv2.imencode(".png", img)
+        return buf.tobytes() if ok else None
 
     def _wire_rosbot3(self):
         # rosbot_v2v_broadcaster's own local debug stats: tx, tx_errors,
@@ -256,6 +412,7 @@ class Dashboard(Node):
 
 
 PAGE_TEMPLATE = """<!doctype html>
+<meta charset="utf-8">
 <meta name=viewport content="width=device-width, initial-scale=1">
 <title>V2V Dashboard -- __MY_LABEL__</title>
 <style>
@@ -275,8 +432,29 @@ PAGE_TEMPLATE = """<!doctype html>
     grid-template-columns: 1fr 1fr; align-items: start;
   }
   @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
-  .cams { display: grid; gap: 14px; grid-template-columns: 1fr 1fr; grid-column: 1 / -1; }
-  @media (max-width: 600px) { .cams { grid-template-columns: 1fr; } }
+  .col { display: grid; gap: 14px; align-content: start; }
+  .col > .panel { margin: 0; }
+  .cams img { width: 100%; display: block; background: #000; aspect-ratio: 4/3; object-fit: contain; }
+  .status {
+    grid-column: 1 / -1; display: grid; gap: 14px;
+    grid-template-columns: 1fr 1fr;
+  }
+  @media (max-width: 900px) { .status { grid-template-columns: 1fr; } }
+  .pill {
+    display: flex; align-items: center; gap: 10px;
+    background: #14171c; border: 1px solid #262b33; border-radius: 10px;
+    padding: 12px 14px;
+  }
+  .dot { width: 13px; height: 13px; border-radius: 50%; flex: none; }
+  .dot.on   { background: #4ade80; box-shadow: 0 0 9px #4ade80; }
+  .dot.move { background: #38bdf8; box-shadow: 0 0 9px #38bdf8;
+              animation: pulse 1s ease-in-out infinite; }
+  .dot.off  { background: #ff5c5c; }
+  @keyframes pulse { 50% { opacity: .35; } }
+  .trackmap { grid-column: 1 / -1; }
+  .trackmap img { display: block; margin: 0 auto; max-width: 100%; background: #121316; }
+  .pill .who { font-weight: 700; font-size: 15px; }
+  .pill .st { margin-left: auto; font-weight: 700; font-variant-numeric: tabular-nums; }
   .panel {
     background: #14171c; border: 1px solid #262b33; border-radius: 10px;
     overflow: hidden;
@@ -312,31 +490,47 @@ PAGE_TEMPLATE = """<!doctype html>
   <span id=stale class=stale style="display:none">-- STALE DATA --</span>
 </header>
 <main>
-  <div class=cams>
-    <div class=panel>
+  <div class=status>
+    <div class=pill><span id=dot-qcar2 class="dot off"></span>
+      <span class=who>QCar 2</span><span id=st-qcar2 class="st muted">--</span></div>
+    <div class=pill><span id=dot-rosbot3 class="dot off"></span>
+      <span class=who>ROSbot 3</span><span id=st-rosbot3 class="st muted">--</span></div>
+  </div>
+
+  <div class="panel trackmap">
+    <h2>Live track &mdash; reference path, QCar 2 (green), ROSbot 3 (orange)</h2>
+    <img id=trackmap src="__TRACKMAP__">
+  </div>
+
+  <div class=col>
+    <div class="panel cams">
       <h2>QCar 2 camera</h2>
       <img id=cam-qcar2 src="__QCAR2_CAM__">
     </div>
-    <div class=panel>
+    <div class=panel><h2>QCar 2 &mdash; link &amp; motion</h2>
+      <table id=link-qcar2></table></div>
+    <div class=panel><h2>QCar 2 &mdash; safety state</h2>
+      <table id=safety-qcar2></table></div>
+    <div class="panel nodes"><h2>QCar 2 &mdash; active ROS nodes</h2>
+      <ul id=nodes-qcar2></ul></div>
+  </div>
+
+  <div class=col>
+    <div class="panel cams">
       <h2>ROSbot 3 camera</h2>
       <img id=cam-rosbot3 src="__ROSBOT3_CAM__">
     </div>
-  </div>
-  <div class=panel>
-    <h2>Link &amp; motion</h2>
-    <table id=t-link></table>
-  </div>
-  <div class=panel>
-    <h2>Safety state</h2>
-    <table id=t-safety></table>
-  </div>
-  <div class="panel nodes">
-    <h2 id=nodes-title>Active ROS nodes (__MY_LABEL__)</h2>
-    <ul id=nodes-list></ul>
+    <div class=panel><h2>ROSbot 3 &mdash; link &amp; motion</h2>
+      <table id=link-rosbot3></table></div>
+    <div class=panel><h2>ROSbot 3 &mdash; safety state</h2>
+      <table id=safety-rosbot3></table></div>
+    <div class="panel nodes"><h2>ROSbot 3 &mdash; active ROS nodes</h2>
+      <ul id=nodes-rosbot3></ul></div>
   </div>
 </main>
 <script>
 const FIELDS_LINK = [
+  ["my_speed", "Own speed (m/s)"],
   ["rx", "Packets received"],
   ["tx", "Packets sent"],
   ["gate_rx", "Gate packets received"],
@@ -392,26 +586,67 @@ function render(tbl, fields, data) {
   }).join("");
 }
 
-function renderNodes(data) {
-  const el = document.getElementById("nodes-list");
-  const nodes = data.nodes || [];
+function renderNodes(id, data) {
+  const el = document.getElementById(id);
+  const nodes = (data && data.nodes) || [];
   el.innerHTML = nodes.length === 0
     ? '<li class=empty>-- none discovered --</li>'
     : nodes.map(n => `<li>${n}</li>`).join("");
 }
 
-async function poll() {
-  try {
-    const res = await fetch("/data.json", {cache: "no-store"});
-    const data = await res.json();
-    render(document.getElementById("t-link"), FIELDS_LINK, data);
-    render(document.getElementById("t-safety"), FIELDS_SAFETY, data);
-    renderNodes(data);
-    const age = data._updated ? (Date.now() / 1000 - data._updated) : 999;
-    document.getElementById("stale").style.display = age > 3 ? "inline" : "none";
-  } catch (e) {
-    document.getElementById("stale").style.display = "inline";
+// A robot is ON when its dashboard answered and its ROS graph is fresh;
+// MOVING is judged from its own speed, so the badge reflects the vehicle
+// rather than merely the web server being up.
+function renderBadge(role, data) {
+  const dot = document.getElementById("dot-" + role);
+  const st = document.getElementById("st-" + role);
+  if (!data) {
+    dot.className = "dot off";
+    st.className = "st bad";
+    st.textContent = "OFFLINE";
+    return;
   }
+  const age = data._updated ? (Date.now() / 1000 - data._updated) : 999;
+  if (age > 5) {
+    dot.className = "dot off";
+    st.className = "st bad";
+    st.textContent = "NO DATA";
+    return;
+  }
+  const v = Number(data.my_speed);
+  const moving = isFinite(v) && Math.abs(v) > 0.02;
+  dot.className = "dot " + (moving ? "move" : "on");
+  st.className = "st " + (moving ? "ok" : "warn");
+  st.textContent = moving
+    ? `ON — MOVING ${Math.abs(v).toFixed(2)} m/s`
+    : (isFinite(v) ? "ON — STOPPED" : "ON");
+}
+
+function paint(role, data) {
+  renderBadge(role, data);
+  render(document.getElementById("link-" + role), FIELDS_LINK, data || {});
+  render(document.getElementById("safety-" + role), FIELDS_SAFETY, data || {});
+  renderNodes("nodes-" + role, data);
+}
+
+async function grab(url) {
+  try {
+    const res = await fetch(url, {cache: "no-store"});
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (e) { return null; }
+}
+
+async function poll() {
+  const [mine, peer] = await Promise.all([
+    grab("/data.json"), grab("__PEER_DATA__")
+  ]);
+  paint("__ROLE__", mine);
+  paint("__PEER_ROLE__", peer);
+  // Stale only when THIS robot's own feed stops; a peer that goes away is
+  // reported by its own badge instead of blaming the whole page.
+  const age = mine && mine._updated ? (Date.now() / 1000 - mine._updated) : 999;
+  document.getElementById("stale").style.display = age > 3 ? "inline" : "none";
 }
 setInterval(poll, 400);
 poll();
@@ -427,6 +662,9 @@ setInterval(() => {
   reconnect("cam-qcar2", "__QCAR2_CAM__");
   reconnect("cam-rosbot3", "__ROSBOT3_CAM__");
 }, 8000);
+
+// The track map is a plain PNG, not a stream -- re-request it to animate.
+setInterval(() => reconnect("trackmap", "__TRACKMAP__"), 500);
 </script>
 """
 
@@ -443,7 +681,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             self.send_response(200)
-            self.send_header("Content-Type", "text/html")
+            # charset matters: the page contains UTF-8 punctuation, and
+            # without it browsers fall back to Latin-1 and render mojibake.
+            self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(self.page_html)))
             self.end_headers()
             self.wfile.write(self.page_html)
@@ -453,9 +693,28 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps(self.dashboard.snapshot()).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            # The unified page is served by ONE robot but fetches the other
+            # robot's data.json directly from the browser, so that origin
+            # must be allowed to read it. Trusted lab network only, same
+            # caveat as the camera stream.
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+
+        if self.path.startswith("/trackmap.png"):
+            png = self.dashboard.render_track_png()
+            if png is None:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", str(len(png)))
+            self.end_headers()
+            self.wfile.write(png)
             return
 
         if self.path.startswith("/stream"):
@@ -496,6 +755,10 @@ def main():
                      help="IP of the OTHER robot running this same script")
     ap.add_argument("--peer-port", type=int, default=None,
                      help="defaults to --port (peer runs on the same port)")
+    ap.add_argument("--trajectory", default=None,
+                     help="reference trajectory .npy to draw the live track "
+                          "map against (QCar side; both vehicles' poses are "
+                          "already in this frame)")
     args = ap.parse_args()
 
     if cv2 is None:
@@ -515,16 +778,28 @@ def main():
     else:
         qcar2_cam_src, rosbot3_cam_src = peer_cam_src, my_cam_src
 
+    peer_role = "rosbot3" if args.role == "qcar2" else "qcar2"
+    # Always local now, for both roles -- each dashboard renders its own
+    # position on its own trajectory (pass --trajectory to populate one).
+    # Previously the ROSbot side always fetched QCar2's /trackmap.png
+    # cross-machine, which showed nothing at all whenever QCar2's stack
+    # wasn't running (found 2026-08-27). QCar2's render still shows both
+    # dots, since it separately receives ROSbot3's pose over V2V.
+    trackmap_src = "/trackmap.png"
     page_html = (
         PAGE_TEMPLATE
         .replace("__MY_LABEL__", role_cfg["label"])
         .replace("__ROLE__", args.role)
+        .replace("__PEER_ROLE__", peer_role)
+        .replace("__PEER_DATA__",
+                 f"http://{args.peer_host}:{peer_port}/data.json")
         .replace("__QCAR2_CAM__", qcar2_cam_src)
         .replace("__ROSBOT3_CAM__", rosbot3_cam_src)
+        .replace("__TRACKMAP__", trackmap_src)
     ).encode()
 
     rclpy.init()
-    node = Dashboard(args.role, camera_topic, args.quality)
+    node = Dashboard(args.role, camera_topic, args.quality, args.trajectory)
 
     Handler.dashboard = node
     Handler.page_html = page_html

@@ -62,10 +62,10 @@ class TrajectoryFollowerNode(Node):
             lookahead_distance=0.15,  # Shorter lookahead for tighter following
             min_lookahead=0.10,
             max_lookahead=0.15,
-            max_speed=0.40,
-            min_speed=0.10,
-            curve_speed=0.12,
-            reverse_speed=0.10,
+            max_speed=0.175,
+            min_speed=0.04375,
+            curve_speed=0.0525,
+            reverse_speed=0.04375,
             max_angular=1.0,
             kp_angular=1.5,
             rotate_first_threshold=0.1,
@@ -85,6 +85,7 @@ class TrajectoryFollowerNode(Node):
         self._lane_max_lookahead = 2.5     # m — only flag obstacles within this forward distance
 
         # Overtaking (left side, German convention)
+        self._overtaking_enabled = False          # QCar is the greedy car — ROSbot only stops/slows, never swerves
         self._overtake_trigger_time = 1.5        # s — must be in slow mode this long before triggering
         self._overtake_lateral_offset = 0.33      # m — how far left of the recorded path to swerve
         self._overtake_check_forward = 2.0       # m — verify left lane clear at least this far ahead
@@ -162,6 +163,9 @@ class TrajectoryFollowerNode(Node):
 
         # GO_TO_START tuning (three-phase: ROTATE → DRIVE → ALIGN)
         self._start_pos_tolerance = 0.10          # m — "close enough" to start
+        self._loop_heading_tolerance = math.radians(20)  # seamless-continue check only — looser than angle_tolerance since pure pursuit corrects small heading error while driving
+        self._loop_dist_tolerance = 0.25          # m — seamless-continue check only, looser than _start_pos_tolerance to absorb drift after obstacle pauses
+        self._resume_on_path_tolerance = 0.5      # m — join the loop from here instead of driving back to the recorded start
         self._rotate_exit_threshold = 0.08        # rad (~5°)  — tight, exits rotate
         self._rotate_reentry_threshold = 0.20     # rad (~23°) — loose, re-enters rotate (hysteresis!)
         self._drive_to_start_speed = 0.12         # m/s — constant forward speed
@@ -400,9 +404,18 @@ class TrajectoryFollowerNode(Node):
             return
         
         if self._state == State.WAITING_FOR_LOCALIZATION:
-            self._state = State.ROTATE_TO_START   # ← was State.GO_TO_START
             self.get_logger().info(f'Localized at ({self._x:.2f}, {self._y:.2f}, θ={math.degrees(self._theta):.1f}°)')
-            self.get_logger().info(f'Start: ({self._trajectory.start.x:.2f}, {self._trajectory.start.y:.2f})')
+            # Already on (or near) the recorded path — join in from here instead of
+            # driving all the way back to the recorded start point.
+            closest_idx = self._trajectory.find_closest_waypoint(self._x, self._y)
+            closest_wp = self._trajectory.waypoints[closest_idx]
+            if closest_wp.distance_to(self._x, self._y) < self._resume_on_path_tolerance:
+                self._trajectory.current_wp_idx = closest_idx
+                self._state = State.FOLLOWING_SEGMENT
+                self.get_logger().info(f'On path at WP {closest_idx} — joining loop (no realign)')
+            else:
+                self._state = State.ROTATE_TO_START
+                self.get_logger().info(f'Off path — heading to start: ({self._trajectory.start.x:.2f}, {self._trajectory.start.y:.2f})')
             return
         
         # Manual pause gate — halts motion without disturbing state
@@ -443,7 +456,7 @@ class TrajectoryFollowerNode(Node):
         start = self._trajectory.start
         dist = math.hypot(start.x - self._x, start.y - self._y)
         heading_error = abs(self._normalize_angle(start.theta - self._theta))
-        if dist < self._start_pos_tolerance and heading_error < self._controller.cfg.angle_tolerance:
+        if dist < self._loop_dist_tolerance and heading_error < self._loop_heading_tolerance:
             self._trajectory.reset()
             self._state = State.FOLLOWING_SEGMENT
             seg = self._trajectory.current_segment
@@ -647,7 +660,8 @@ class TrajectoryFollowerNode(Node):
             return
 
         # If we've been slowed for long enough AND the left lane is clear, overtake
-        if (self._slowdown_timer >= self._overtake_trigger_time
+        if (self._overtaking_enabled
+                and self._slowdown_timer >= self._overtake_trigger_time
                 and not is_reverse
                 and self._is_overtake_feasible()):
             
