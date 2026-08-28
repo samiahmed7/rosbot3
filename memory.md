@@ -604,3 +604,144 @@ for today — communication link, fail-safe contract, and the command/gate
 direction are all now verified on real hardware, not just read about or
 bench-tested. Remaining known gap is still the map-frame alignment
 between the two robots' independent SLAM maps (separate open item).
+
+---
+
+# ROSbot 3 Autonomous Driving Bring-Up + Joint V2V Runs (Session 5, 2026-08-27/28)
+
+Two long hardware sessions running ROSbot 3 autonomously alongside QCar 2.
+Most of the QCar-side work is logged in that repo instead; this covers the
+ROSbot 3 side and the shared V2V findings.
+
+### The wall-hit bug: `run_rosbot3_stack.sh` never called global localization
+
+The headline result. ROSbot 3 repeatedly drove off the recorded path and
+into walls — three separate incidents — while its own logs showed the
+waypoint index advancing normally. AMCL covariance never tightened below
+~0.3 m / 15 deg during any real driving, but nothing looked obviously
+broken.
+
+Root cause: the new `run_rosbot3_stack.sh` activated `map_server` and
+`amcl` and then started driving, but never called
+`/reinitialize_global_localization`. The manual four-terminal flow in
+`README.md` has always done this (Part 2, Terminal 3) — the script simply
+omitted it. Without that call AMCL stays anchored at the map origin from
+`amcl_params.yaml`'s seeded `initial_pose`, and if the robot's real start
+pose differs at all, that wrong belief persists: covariance never
+converges, and the follower drives a path that is correct in AMCL's frame
+but wrong in the real world.
+
+Fixed by adding the service call to `launch_localization()` after both
+lifecycle nodes reach `active`, with the failure reported loudly rather
+than suppressed. **Verified on hardware — the follower works correctly
+via the script now.**
+
+Worth internalising: the symptom (drives confidently into a wall while
+believing it is tracking) looks like a follower/tuning bug and is not.
+`track_error` stays *low* throughout, because the robot tracks its
+wrong-but-self-consistent belief perfectly. Low tracking error is not
+evidence of good localization.
+
+### Things ruled out along the way (do not re-investigate blind)
+
+- **IMU.** Suspected a stuck driver because `/rosbot3/imu/data`
+  orientation was bit-for-bit identical across reads. Tested directly
+  with teleop and live monitoring: the values change correctly under real
+  motion. The identical readings were true stillness plus 16-bit
+  quantisation, not a frozen sensor. IMU is healthy.
+- **The collar.** Removed for a full test; the loose-convergence pattern
+  persisted. Not the cause of this failure (still a plausible contributor
+  to general jitter — it does sit in the scan plane).
+- **AMCL `alpha1-5` motion-model noise.** Deliberately *not* changed.
+- **Stale FastDDS shared memory** was a genuine, separate failure earlier
+  the same night: AMCL sat `active` with healthy scan/odom but published
+  `(0,0,0)` forever. 66 stale `/dev/shm/fastrtps*` segments. Clearing them
+  fixed it. Same pattern already seen on QCar 2. Check
+  `ls /dev/shm | wc -l` early when a node looks alive but does nothing.
+
+### Silent failure mode worth knowing: the V2V gate
+
+Launching `trajectory_follower_node.py` with the V2V remap
+(`-r /rosbot3/cmd_vel:=/rosbot3/cmd_vel_raw`) but *without*
+`rosbot_v2v_gate.py` running means the follower publishes into a topic
+nothing relays. The robot sits completely still while the follower logs
+normal progress. Indistinguishable from a localization freeze unless you
+check `/rosbot3/cmd_vel` directly. Cost real debugging time.
+
+### `v2v_dashboard.py` — made to work standalone on ROSbot 3
+
+It previously only rendered the live track when run as QCar 2's peer.
+Fixed: TF buffer and pose polling moved out of the QCar2-only setup path
+into `__init__`; `.csv` trajectories load as well as `.npy`; each role
+renders its own local view rather than fetching the peer's; track
+orientation is role-dependent (the two robots' independently recorded maps
+share no orientation convention); and the robot dot labels/colours are now
+identity-based, so a colour always means the same robot on either
+dashboard. Also fixed a real leak — two `create_subscription` calls had
+been left inside a 0.2 s timer callback, recreating subscriptions five
+times a second for the life of the process.
+
+### OPEN, UNRESOLVED: the V2V gap reads ~2x the real distance
+
+The most important thing left. `/v2v/gap` and the dashboard reported
+**1.051 m** when the physical chassis-to-chassis distance measured
+**57 cm**. Ruled out so far:
+
+- Not a curvature/arc-length artifact — the reference path is effectively
+  straight between the two indices involved; chord distance and along-path
+  distance agree to three decimals.
+- Not a stale-recording mismatch — trajectory and calibration dates are
+  consistent, and QCar 2's frozen map was untouched by its cartographer
+  retuning.
+- Not `path_spacing` — `arc_length` is built from real point-to-point
+  geometry (`np.cumsum` of segment norms), not from the configured nominal
+  spacing. The code explicitly avoids that.
+- Not QCar 2's own localization — confirmed live that its dashboard
+  position matches its physical position.
+
+**Next step:** check whether ROSbot 3's own dashboard position matches
+where it physically is. That single test separates ROSbot 3's AMCL from
+the map-frame transform. Arithmetic favours AMCL: the system placed
+ROSbot 3 roughly 48 cm too far along the path, and the transform's worst
+landmark residual is 12.2 cm, so the transform cannot produce that alone.
+It is also suggestive that the robot was reported stationary
+(`v=0.000, moving=0`) at the time — exactly when a stale or
+poorly-converged AMCL pose goes unnoticed.
+
+A *second*, separate discrepancy (0.661 m reported vs 19 cm physical) was
+seen during an active pass and **is** explained: along-path gap is blind
+to lateral offset, so during a 0.70 m swerve two vehicles can be nearly
+touching while the along-path number looks comfortable. Different
+mechanism; fixing the first will not fix this. Do not use `/v2v/gap` for
+proximity during a pass — use the LiDAR side sectors.
+
+### Map-frame transform: which numbers are real
+
+Three sets exist and it is easy to grab the wrong one. The live values,
+verified on the car in both workspaces, are
+`frame_tx=1.3814, frame_ty=0.4986, frame_tyaw=-3.030697`, derived by
+**loop-to-loop ICP** at 4.7 cm RMS / 12.2 cm max. The values recorded in
+`TODO.md`'s older section (`-4.679956 / -3.745196 / -0.705757`) are
+**superseded** and now carry a warning there.
+
+The **two-landmark method was abandoned as inconsistent** — the same two
+physical marks measured 4.370 m apart in ROSbot 3's map and 3.460 m in
+QCar 2's, which is impossible for a rigid transform. The `?` left in
+`~/Desktop/v2v_calibration/landmark_measurements_INCONSISTENT.txt` is a
+dead end, not outstanding work. Likely cause of that failure: poor AMCL
+convergence on the readings themselves (the one recorded QCar 2 landmark
+had std y=11.5 cm, yaw=5.64 deg). Supporting this, a rigid ICP could not
+have hit 4.7 cm RMS across a ~16 m loop if the maps genuinely disagreed
+on scale by 21%.
+
+### Open items
+
+- Resolve the gap discrepancy (above) before building anything that
+  reasons about V2V distance.
+- `run_rosbot3_stack.sh` is new and only lightly exercised beyond the
+  localization fix.
+- `map_icp.py` and the cached `frame_tf.npy` used for the calibration were
+  lost with a cleared scratchpad. If the transform ever needs re-deriving,
+  that script must be rewritten. Sweep the initial rotation over the full
+  circle — the correct seed was -180 deg, and a local-minimum seed gives a
+  confidently wrong answer.
