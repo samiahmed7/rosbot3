@@ -19,6 +19,28 @@
 # "the publisher died" is not the same guarantee as "the wheels stopped."
 
 set -u
+
+# --------------------------------------------------------------------
+# Refuse to run inside the .venv.
+#
+# config/smooth.py needs pandas, which cannot be installed system-wide
+# here (PEP 668, no sudo), so .venv exists purely for that one script.
+# It is NOT a ROS environment: rclpy does not even import under it
+# ("No module named 'yaml'"), and its numpy (2.5.1) is a different
+# version from the one rclpy is built against (2.3.0). Every node this
+# script launches would fail, or worse, fail oddly.
+#
+# Activating .venv also shadows python3 for the whole shell, so a
+# terminal that has it active poisons anything started from it -- which
+# is exactly how it usually happens.
+if [ -n "${VIRTUAL_ENV:-}" ]; then
+    echo "ERROR: a Python virtualenv is active:" >&2
+    echo "         $VIRTUAL_ENV" >&2
+    echo "       ROS nodes cannot run inside it -- rclpy will not import." >&2
+    echo "       Run 'deactivate' in this shell, then start this script again." >&2
+    echo "       The venv is only for: .venv/bin/python3 config/smooth.py" >&2
+    exit 1
+fi
 cd "$(dirname "$0")" || { echo "can't find repo root"; exit 1; }
 
 LOGDIR=/tmp/rosbot3_run_logs

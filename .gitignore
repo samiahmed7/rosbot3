@@ -20,6 +20,10 @@ __pycache__/
 *.kate-swp
 *~
 .vscode/
+# ...except the shared workspace settings, which stop the Python
+# extension auto-activating .venv in every new terminal (see README).
+!.vscode/
+!.vscode/settings.json
 .idea/
 
 # OS cruft

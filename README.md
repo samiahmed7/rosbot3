@@ -28,17 +28,75 @@ combination this repo has actually been run and debugged against:
 > have been updated accordingly. If you're on an older Husarion image that
 > *does* publish a filtered scan topic, you may want to switch back.
 
-> **Note on `pandas` / `config/smooth.py`:** `rosbot-server` is an
-> externally-managed Python install (PEP 668) with no sudo access on this
-> university machine, so `pandas` can't just be `pip install`ed system-wide.
-> Use a local venv instead (`smooth.py` is a standalone script, no `rclpy`
-> needed, so a plain venv works):
-> ```bash
-> python3 -m venv .venv
-> .venv/bin/pip install pandas numpy scipy
-> .venv/bin/python3 config/smooth.py
-> ```
-> `.venv/` is already in `.gitignore`.
+> **`pandas` is not in system Python.** `rosbot-server` is an
+> externally-managed install (PEP 668) with no sudo, so it cannot be
+> installed system-wide. `config/smooth.py` is the only thing that needs
+> it — see [The `.venv` is opt-in](#the-venv-is-opt-in) below.
+
+## The `.venv` is opt-in
+
+**Do not activate it.** It exists for exactly one script,
+`config/smooth.py`, which needs `pandas`. Everything else in this repo —
+every ROS node, every launcher — must run on **system Python**.
+
+Activating it breaks ROS, and not subtly:
+
+| | system | `.venv` |
+|---|---|---|
+| `import rclpy` | works | **fails** — `No module named 'yaml'` |
+| numpy | 2.3.0 (what `rclpy` is built against) | 2.5.1 |
+| pandas | missing | 3.0.3 |
+
+Activating puts `.venv/bin` first on `PATH` for the whole shell, so it
+shadows `python3` for anything started from that terminal — including
+editors and tools launched from it. That is the usual way this goes
+wrong: the venv gets activated once, and every ROS command in that
+terminal afterwards fails for reasons that look unrelated.
+`run_rosbot3_stack.sh` refuses to start if `VIRTUAL_ENV` is set, rather
+than launching nodes that will fail oddly.
+
+**Run the one script that needs it by interpreter path — no activation:**
+
+```bash
+.venv/bin/python3 config/smooth.py
+```
+
+Create it once, if it does not exist:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install pandas numpy scipy
+```
+
+If you *do* activate it for some reason, undo it before touching ROS:
+
+```bash
+deactivate            # then confirm:
+which python3         # must be /usr/bin/python3, not .../.venv/bin/python3
+echo "$VIRTUAL_ENV"   # must be empty
+```
+
+`.venv/` is in `.gitignore`, so it is per-machine and never committed.
+
+### If your terminal keeps activating it by itself
+
+VS Code's Python extension defaults `python.terminal.activateEnvironment`
+to `true` and auto-detects the `.venv` in this workspace, so **every new
+terminal silently runs `source .venv/bin/activate`** before you type
+anything. Nothing in `~/.bashrc` does this — a plain `bash -l` is clean —
+which is what makes it confusing to track down.
+
+`.vscode/settings.json` in this repo turns it off:
+
+```json
+"python.terminal.activateEnvironment": false,
+"python.defaultInterpreterPath": "/usr/bin/python3"
+```
+
+**Reload the VS Code window after this lands** (Ctrl+Shift+P → *Developer:
+Reload Window*), then open a fresh terminal. The prompt should have no
+`(.venv)` prefix and `which python3` should be `/usr/bin/python3`.
+
 
 See [structure.md](structure.md) for what every file in this repo does, and
 [guide.md](guide.md) for the full step-by-step recording/smoothing/running

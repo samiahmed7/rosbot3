@@ -1,0 +1,19 @@
+{
+  // Do NOT auto-activate .venv in new terminals.
+  //
+  // The Python extension defaults this to true and auto-detects the
+  // .venv in this workspace, so every new terminal silently ran
+  //     source .../.venv/bin/activate
+  // That venv exists only for config/smooth.py (pandas). It is not a ROS
+  // environment: rclpy does not import under it, and its numpy differs
+  // from the one rclpy is built against. Activating it shadows python3
+  // for the whole terminal, so every ROS command started there fails for
+  // reasons that look unrelated to the venv.
+  //
+  // Run the one script that needs it by path instead:
+  //     .venv/bin/python3 config/smooth.py
+  "python.terminal.activateEnvironment": false,
+
+  // Point the extension at system Python so it stops selecting .venv.
+  "python.defaultInterpreterPath": "/usr/bin/python3"
+}
