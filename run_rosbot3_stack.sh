@@ -213,10 +213,86 @@ launch_localization() {
     echo "  requesting global localization (/reinitialize_global_localization)..."
     if timeout 15 ros2 service call /reinitialize_global_localization \
         std_srvs/srv/Empty >/dev/null 2>&1; then
-        echo "  global localization requested — drive with turns to converge."
+        echo "  global localization requested."
     else
         echo "  WARNING: /reinitialize_global_localization call failed — AMCL is"
         echo "           still seeded at the map origin and may not converge."
+    fi
+
+    # A freshly (re)activated AMCL reports lifecycle state "active" and a
+    # resolvable map->base_link TF well before it has actually converged —
+    # its particle filter starts spread across the whole map and needs real
+    # motion to disambiguate, not just elapsed time. Confirmed live
+    # 2026-08-30: TF resolved to a plausible-looking pose that was ~2m
+    # outside the recorded track's bounds (dashboard's live-track marker
+    # rendered off-canvas because of it) with ZERO /amcl_pose messages
+    # published since activation — not a display bug, AMCL genuinely
+    # hadn't produced an estimate yet. Rotating in place is what converges
+    # it; parameters below (0.4 rad/s, 8s each way) are what was just
+    # verified live to reach cov_xx/cov_yy ~0.02 from cold.
+    #
+    # Real motion — same caution as everywhere else in this script: know
+    # where the robot is and keep the E-Stop path in mind before this runs.
+    echo "  rotating in place to converge AMCL (the robot WILL move) ..."
+    if ! timeout 40 /usr/bin/python3 - <<'PYEOF'
+import math, time, sys
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import PoseWithCovarianceStamped, TwistStamped
+
+rclpy.init()
+n = Node('amcl_converge_check')
+pub = n.create_publisher(TwistStamped, '/rosbot3/cmd_vel', 10)
+poses = []
+n.create_subscription(
+    PoseWithCovarianceStamped, '/amcl_pose', lambda m: poses.append(m), 10
+)
+
+def spin_cmd(wz, secs):
+    t0 = time.time()
+    t = TwistStamped()
+    while rclpy.ok() and time.time() - t0 < secs:
+        t.header.stamp = n.get_clock().now().to_msg()
+        t.twist.angular.z = wz
+        pub.publish(t)
+        rclpy.spin_once(n, timeout_sec=0.05)
+
+spin_cmd(0.4, 8.0)
+spin_cmd(-0.4, 8.0)
+
+t = TwistStamped()
+for _ in range(20):
+    t.header.stamp = n.get_clock().now().to_msg()
+    pub.publish(t)
+    time.sleep(0.05)
+
+t0 = time.time()
+while rclpy.ok() and time.time() - t0 < 8.0 and not poses:
+    rclpy.spin_once(n, timeout_sec=0.3)
+
+ok = False
+if poses:
+    m = poses[-1]
+    c = m.pose.covariance
+    print(f"  amcl_pose: ({m.pose.pose.position.x:+.3f},"
+          f"{m.pose.pose.position.y:+.3f})  "
+          f"cov_xx={c[0]:.4f} cov_yy={c[7]:.4f}  "
+          f"({len(poses)} updates)")
+    ok = c[0] < 0.10 and c[7] < 0.10
+else:
+    print("  still zero /amcl_pose updates after rotating")
+
+n.destroy_node()
+rclpy.shutdown()
+sys.exit(0 if ok else 1)
+PYEOF
+    then
+        echo "  WARNING: AMCL did not converge to a tight covariance after"
+        echo "           rotating. Position-dependent things (the dashboard's"
+        echo "           live track, the V2V broadcaster's predicted path)"
+        echo "           may be wrong. Try 'r' again, or rotate it by hand."
+    else
+        echo "  AMCL converged."
     fi
 
     local n; n=$(timeout 5 ros2 node list 2>/dev/null | grep -c '^/amcl$')
