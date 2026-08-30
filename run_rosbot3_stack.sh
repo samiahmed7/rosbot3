@@ -422,7 +422,28 @@ full_shutdown() {
     pkill -9 -f 'tf_relay.py|localization_launch.py|nav2_amcl|nav2_map_server|rosbot_v2v_gate.py|rosbot_v2v_broadcaster.py|trajectory_follower_node.py|v2v_dashboard.py' 2>/dev/null
     echo "  done."
 }
-trap full_shutdown EXIT INT TERM
+
+# full_shutdown() never calls exit -- it can't, since EXIT is trapped to
+# it too, and calling exit from inside an EXIT-trapped function is what
+# double-runs cleanup. That's fine for the 'q' path (break -> exit 0 ->
+# the EXIT trap fires once, naturally). It is NOT fine for Ctrl-C: INT was
+# trapped to the same non-exiting function, so pressing it safely killed
+# every ROS process (confirmed) but left this script's own interactive
+# loop running -- it just landed back on the `read` prompt, looking
+# "stuck" even though the robot side had already shut down cleanly
+# (found 2026-08-30, two Ctrl-C's in a row both re-ran shutdown and
+# neither one closed the terminal).
+#
+# INT/TERM get their own handler: run the same cleanup, then disable all
+# traps before calling exit so the EXIT trap that this exit ALSO fires
+# doesn't run full_shutdown a second time on an already-empty stack.
+on_signal_shutdown() {
+    full_shutdown
+    trap - EXIT INT TERM
+    exit 130
+}
+trap full_shutdown EXIT
+trap on_signal_shutdown INT TERM
 
 # --------------------------------------------------------------------
 check_robot_online
