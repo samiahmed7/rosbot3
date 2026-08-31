@@ -24,12 +24,24 @@ before a deadline is the wrong trade.
 
 ### BLOCKERS — resolve before building anything on top of the V2V gap
 
-- [ ] **B1. The V2V gap number is wrong by roughly 2x, cause unknown.**
+- [x] **B1. The V2V gap number is wrong by roughly 2x, cause unknown.**
       Measured on hardware 2026-08-28: dashboard/`/v2v/gap` read **1.051 m**
       while a tape measure between chassis read **57 cm** (~1.84x). This is
       *the* blocker: the supervisor explicitly wants the V2V location check,
       and gap-magnitude filtering (D1 below) is built directly on this number.
       A filter fed a 2x-wrong distance makes confidently wrong decisions.
+      **Root cause found and fixed 2026-08-31**: `signed_gap_along()` reports
+      `base_link`-to-`base_link` distance, but real-world measurements are
+      bumper-to-bumper. Both robots' `base_link` sits at their chassis
+      center, so the gap was inflated by each vehicle's own half-length —
+      `qcar2_overhang_m` (0.2125) + `rosbot3_overhang_m` (0.0985) = ~31cm.
+      `v2v_receiver_node.py` now subtracts this (sign preserved). Live
+      test: a 25cm physical gap that previously read `-0.481` now reads
+      `-0.049` — much closer to real life, per direct comparison. The
+      remaining ~20cm is the separate `frame_tx/ty/tyaw` calibration error
+      (see the P1-P5 landmark section in `qcar2_side/memory.md` and this
+      repo's `memory.md` — a 5-point least-squares fit gave 19.8cm RMS,
+      not worth writing over the current ICP transform).
       Already ruled out, do not re-investigate:
     - **Not a curvature/arc-length artifact.** Verified the reference path is
       effectively straight between the two indices involved — chord distance
@@ -50,7 +62,7 @@ before a deadline is the wrong trade.
       out too, the calibration becomes the prime remaining suspect and should
       be re-derived by loop-to-loop ICP.
 
-- [ ] **B2. Along-path gap is structurally blind to lateral offset — known,
+- [x] **B2. Along-path gap is structurally blind to lateral offset — known,
       affects design not correctness.** A *second*, separate discrepancy was
       seen during an actual pass: `/v2v/gap` 0.661 m vs 19 cm physical
       (~3.48x). This one **is** explained: `signed_gap_along()` measures
@@ -60,19 +72,47 @@ before a deadline is the wrong trade.
       the pass itself — use the LiDAR side sectors (`right_min`/`right_count`)
       for lateral clearance. Different mechanism from B1; fixing B1 will not
       fix this.
+      **Verified 2026-08-31, no code change needed**: audited every use of
+      `/v2v/gap` in `lidar_overtake_node.py` and `overtake_state_machine.py`.
+      Lateral-clearance decisions during `OVERTAKE_LEFT`/`RETURN_RIGHT`
+      already come entirely from LiDAR side sectors (`left_clear`/
+      `right_clear`/`right_count` in `overtake_state_machine.py`) — `/v2v/gap`
+      never feeds them. The only place `/v2v/gap` is used
+      (`commit_check_distance` in `lidar_overtake_node.py`) is a different,
+      legitimate purpose: deciding whether there's enough *longitudinal*
+      runway to commit to *starting* an overtake, not a lateral safety check
+      during the pass itself. The codebase already follows this item's own
+      guidance.
 
-- [ ] **B3. `path_mpc` has no staleness watchdog on `/v2v/follow_speed_cap`.**
+- [x] **B3. `path_mpc` has no staleness watchdog on `/v2v/follow_speed_cap`.**
       If `v2v_receiver` dies (it crashed once on 2026-08-28), the last cap
       value freezes in place indefinitely instead of falling back to "no
       restriction". The crash itself is fixed, but the missing watchdog is
       not. Low effort, worth doing before relying on V2V for decisions.
+      **DONE 2026-08-31** in `path_mpc_node.py`: `/v2v/follow_speed_cap` is
+      `Float32` (no header/stamp), so freshness is tracked the same way
+      `v2v_receiver_node` judges its own UDP link — arrival time on a
+      monotonic clock, recorded in `v2v_follow_speed_cap_callback`. If more
+      than `v2v_follow_speed_cap_stale_sec` (1.0s) has passed since the last
+      message, `update_v2v_follow_cap_filter()` now treats the cap as -1.0
+      (no restriction) instead of reusing the frozen last value. Built and
+      deployed to the car; `path_mpc` restarted cleanly, `Localization
+      stable. MPC enabled.` confirmed. Not yet tested against an actual
+      `v2v_receiver` kill on hardware.
 
 ---
 
 ### THE BUG THE SUPERVISOR DEMOED (highest value, ~10 lines)
 
 - [x] **A1. Add an abort-to-return path to the overtake state machine.**
-      **WRITTEN + BUILT 2026-08-28 into `ros2_ws_sami` — NOT yet hardware-tested.**
+      **WRITTEN + BUILT 2026-08-28 into `ros2_ws_sami` — hardware-tested
+      2026-08-30 with QCar 2 alone (ROSbot 3 not running) and confirmed
+      working; independently corroborated live, the same day's driving
+      log showed `abort_return=True` latched in `lidar_overtake`'s
+      output. HARDWARE-TESTED 2026-08-31 with ROSbot 3 also running and
+      confirmed working** — the supervisor's demoed scenario (a real
+      two-vehicle overtake) has now been exercised with both vehicles
+      live.
       Overtake lane blocked + original lane empty (`right_clear and
       right_count == 0`) now transitions to `RETURN` instead of `WAIT`;
       `WAIT` is reserved for when both lanes are blocked. Deliberately not
@@ -85,8 +125,8 @@ before a deadline is the wrong trade.
       a normal completion. Verified offline against the supervisor's exact
       scenario (4 cases incl. a regression that normal passes still work).
       **To test:** stand in the overtake lane mid-pass — expect
-      `state=RETURN_RIGHT`, `offset=0.00`, `motion=True`, `abort_return=True`
-      instead of a stop.
+      `state=LC_RIGHT` (renamed from `RETURN_RIGHT` by D3, 2026-08-31),
+      `offset=0.00`, `motion=True`, `abort_return=True` instead of a stop.
       In `src/qcar_science_night_pkg/qcar_science_night_pkg/overtake_state_machine.py`,
       the `OVERTAKE` branch currently has exactly one escape when the overtake
       lane becomes blocked:
@@ -121,9 +161,9 @@ before a deadline is the wrong trade.
 
 | Paper concept | Our stack today | Work needed |
 |---|---|---|
-| **LK** (lane-keeping, Eq. 31) | `DRIVE` | exists, rename only |
+| **LK** (lane-keeping, Eq. 31) | `LK` (renamed from `DRIVE`, D3 done 2026-08-31) | done |
 | **LP** (lane-probing, Eq. 32) | *missing* — we jump straight to full commit or full stop | the real gap, see D2 |
-| **LC** (lane-changing, Eq. 33) | `OVERTAKE_LEFT` / `RETURN_RIGHT` | exists, rename only |
+| **LC** (lane-changing, Eq. 33) | `LC_LEFT` / `LC_RIGHT` (renamed from `OVERTAKE_LEFT`/`RETURN_RIGHT`, D3 done 2026-08-31) | done |
 | **Gap Magnitude Judge** (Alg. 2 line 6 — filter candidate gaps lacking space) | partial: `enough_distance_to_overtake` | extend with V2V, see D1 |
 
 - [ ] **D1. Gap-magnitude filtering using the V2V location (the supervisor's
@@ -139,9 +179,34 @@ before a deadline is the wrong trade.
       (`cap = leader_speed + gain*(gap - target)`) is already a crude LP: it
       holds station behind ROSbot 3. What's missing is the explicit state, the
       filtering, and the abort path (A1).
-- [ ] **D3. Rename states to LK / LP / LC** so the implementation reads as an
+- [x] **D3. Rename states to LK / LP / LC** so the implementation reads as an
       IDEAM reconstruction rather than an ad-hoc FSM. Cheap, and it is what
       makes the deliverable legible to the supervisor.
+      **DONE 2026-08-31, partial by design** — no `LP` yet since D2 (the
+      actual lane-probing state) isn't built. Renamed in
+      `overtake_state_machine.py`, `path_mpc_node.py`, and
+      `lidar_overtake_node.py`: `DRIVE`→`LK`, `OVERTAKE_LEFT`→`LC_LEFT`,
+      `RETURN_RIGHT`→`LC_RIGHT`. `WAIT_FOR_CLEAR`/`EMERGENCY_STOP` kept
+      their own names (no paper analog). Full grep across the repo
+      confirmed the only other file referencing these strings
+      (`qcar_lane_pkg/mpc_controller_2.py`) is dead/unlaunched legacy code
+      — left untouched, out of scope.
+      **Bonus find while auditing the rename's blast radius**: `path_mpc_
+      node.py` had three checks against `"OBSTACLE_SLOW"`, a state that
+      turned out to be **dead code** — nothing in `overtake_state_machine.py`
+      or `lidar_overtake_node.py` has ever published it (confirmed via a
+      full grep of every `/drive_state` producer). One of those checks was
+      the exact gate my B3 fix (same session) had just been built on top
+      of; traced through and confirmed it still behaved correctly by
+      accident (the dead condition was equivalent to "never", same as the
+      intended "not during LC_LEFT/LC_RIGHT"). Removed the dead branch and
+      re-pointed that gate at the real state (`LK`) instead, which is
+      behavior-preserving (redundant-but-harmless during `LK`, since
+      `apply_state_machine_reference()` doesn't touch `target_v` there) but
+      makes the guard actually mean what its comment says, instead of
+      being a no-op that happened to have the right effect.
+      Built and deployed to the car; not yet hardware-tested with an actual
+      overtake since the rename (stack was up and stationary at the time).
 
 ---
 
@@ -153,9 +218,11 @@ where time actually goes — 2026-08-27/28 is the evidence.
 - [ ] **Step 0 — B1 diagnostic (~15 min).** Check ROSbot 3's own dashboard
       position against physical. Everything else that touches the gap number
       depends on this.
-- [ ] **Step 1 — A1 abort-to-return (~1-2 h incl. hardware test).** Fixes the
-      exact scenario the supervisor demonstrated. Do this first even if B1
-      drags — it is independent of gap accuracy.
+- [x] **Step 1 — A1 abort-to-return (~1-2 h incl. hardware test).**
+      Fixes the exact scenario the supervisor demonstrated. QCar-2-alone
+      hardware test passed 2026-08-30; full test with ROSbot 3 running
+      passed 2026-08-31 (see A1 above). Was started first, ahead of B1,
+      since it never depended on gap accuracy.
 - [ ] **Step 2 — D1 gap-magnitude filtering (~3-4 h).** Blocked by B1.
 - [ ] **Step 3 — D2 explicit LP state (~4-5 h).**
 - [ ] **Step 4 — Hardware integration + tuning (~4-6 h).** Budget generously.

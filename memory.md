@@ -745,3 +745,92 @@ on scale by 21%.
   that script must be rewritten. Sweep the initial rotation over the full
   circle — the correct seed was -180 deg, and a local-minimum seed gives a
   confidently wrong answer.
+
+### Fresh two-point landmark re-calibration, in progress (2026-08-31)
+
+The live ICP transform (`frame_tx=1.3814, frame_ty=0.4986,
+frame_tyaw=-3.030697`) was found this session to have ~22cm of real error
+(computed/dashboard gap ~-0.45/-0.481m vs 25cm measured with an iPhone
+Measure app). Redoing the two-landmark method properly this time — full
+details and QCar 2's own readings are in `qcar2_side/memory.md`.
+
+- **P1 = QCar 2's Start Point.** ROSbot 3 placed there, AMCL pose:
+  `x=1.2470, y=0.3109, yaw=-1.8 deg`, cov_xx=0.022/cov_yy=0.014 (well
+  converged). Cross-checked against ROSbot 3's own
+  `config/smoothed_trajectory.csv`: 1.35m from that file's idx 0 (expected
+  — the two robots started recording their loops at different physical
+  points), but only **2.1cm** from idx 292/316 — confirms the pose is
+  genuinely accurate at this physical location, not just self-reported.
+  QCar 2's own reading at the same physical point:
+  `x=0.0903, y=-0.0448, yaw=-178.88 deg` (QCar 2's map frame).
+- **P2 — ROSbot 3 (superseded first attempt)**: placed manually. First
+  AMCL reading after the move was stuck near the P1 belief
+  (`x=1.2144, y=0.2629`, only 5.8cm from the P1 reading,
+  cov_xx=0.084/cov_yy=0.100 rising) — same non-convergence bug the
+  automatic-rotation fix targets, just not automatic here since this was
+  a manual placement mid-session, not a stack relaunch. Fixed by running
+  the exact recipe from `run_rosbot3_stack.sh`'s `launch_localization()`
+  by hand: `/reinitialize_global_localization` service call, then
+  rotate-in-place (0.4 rad/s, 8s each way) — took 3 passes to fully
+  converge (cov_xx 5.97 -> 0.18 -> 0.035). Converged pose:
+  `x=5.7711, y=1.1446, yaw=139.80 deg`, cov_xx=0.035/cov_yy=0.017.
+  Cross-checked: 12cm from `smoothed_trajectory.csv` idx 72/316 (on-path).
+  **Abandoned**: solving the transform from this P1/P2 pair against
+  QCar 2's readings gave a 9.7% scale mismatch (P1-P2 baseline 4.60m in
+  ROSbot 3's frame vs. 5.05m in QCar 2's — impossible for a rigid
+  transform) and a 22cm residual — the same failure signature as the
+  2026-08-05 abandoned attempt in `TODO.md`. Root cause suspected to be
+  a QCar 2 P2 reading that, while converged, sat ~0.68m outside its own
+  recorded trajectory's bounding box (see `qcar2_side/memory.md`) — real
+  but off the intended landmark area. Replaced with a P2 much closer to
+  P1 (below), reducing exposure to this class of error.
+- **P2 — ROSbot 3 (current)**: placed at the same physical point as QCar
+  2's revised P2 (~2m from P1 on ROSbot 3's side too). The whole ROSbot 3
+  stack had been fully stopped since earlier in the session — relaunched
+  via `run_rosbot3_stack.sh` (had to `unset VIRTUAL_ENV` first — the
+  script's own venv guard blocked it since this shell had `.venv`
+  active). The automatic rotation in `launch_localization()` did NOT
+  converge on its own this time (logged its WARNING, pose way off at
+  `x=1.99, y=-5.39`) — took 2 more manual rotation passes
+  (`/reinitialize_global_localization` was already latched from launch)
+  to fully converge: cov_xx/cov_yy went `0.417(y) -> 0.022/0.018`.
+  **Converged pose: `x=3.2103, y=0.1622, yaw=50.62 deg`**, cov_xx=0.022,
+  cov_yy=0.018. Cross-checked: 11cm from `smoothed_trajectory.csv` idx
+  12/316 (on-path).
+
+  **Both landmark pairs now collected — ready to solve the 2-point rigid
+  transform** (rotation from the angle between the two landmark vectors
+  in each frame, then translation) and write the result into QCar 2's
+  `config/v2v_params.yaml` (`frame_tx/frame_ty/frame_tyaw`):
+
+  | Robot | x | y | yaw |
+  |---|---|---|---|
+  | P1 — QCar 2 | 0.0903 | -0.0448 | -178.88 deg |
+  | P1 — ROSbot 3 | 1.2470 | 0.3109 | -1.80 deg |
+  | P2 — QCar 2 | -1.5794 | -0.0092 | 178.50 deg |
+  | P2 — ROSbot 3 | 3.2103 | 0.1622 | 50.62 deg |
+  | P3 — QCar 2 | -4.0210 | -2.5510 | -85.47 deg |
+  | P3 — ROSbot 3 | 5.7637 | 2.8376 | 145.62 deg |
+  | P4 — QCar 2 | -1.4479 | -3.7184 | 42.46 deg |
+  | P4 — ROSbot 3 | 2.9732 | 3.9274 | -147.22 deg |
+  | P5 — QCar 2 | 0.8941 | -1.5624 | 28.84 deg |
+  | P5 — ROSbot 3 | 0.3460 | 1.9936 | -116.77 deg |
+
+  **2026-08-31 finding that motivated collecting more than 2 points**: the
+  two robots' independently-recorded trajectories agree on total loop
+  length to within 0.8% (QCar 2: 16.19m, ROSbot 3: 16.06m) — ruling out a
+  real map-scale mismatch. The 15-21% "baseline mismatch" seen when
+  solving from only 2 points (P1+P2, both attempts) was noise
+  amplification from a short (~2m) baseline, not a fundamental
+  incompatibility between the maps. User decided (given today's driving
+  incidents on QCar 2, see `qcar2_side/memory.md`) that P3+ points would
+  be reached by **manual/hand driving only, no more autonomous driving
+  this session** — collect a P4/P5 the same way, then solve a
+  least-squares rigid transform (not just a 2-point closed-form solve)
+  across all points.
+  Also found and fixed along the way: ROSbot 3 physically lost power
+  between P2 and P3 (network went fully unreachable, `ping` timed out,
+  `ros2 node list` showed only server-side nodes) — not a software issue,
+  just the robot being turned off. Confirmed back online once its
+  onboard driver nodes (`differential_drive_controller`, IMU, camera)
+  reappeared in the ROS graph before retrying localization.
