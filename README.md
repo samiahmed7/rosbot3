@@ -118,6 +118,60 @@ A critical component of this setup is the `tf_relay` node. It maps the current `
 
 **Dependencies:** For the core following functionality to work, you really only need the main follower node (`trajectory_follower_node.py`) and the 2 other core files being used in it (`pure_pursuit.py` and `trajectory.py`).
 
+## Quick start: `run_rosbot3_stack.sh`
+
+`run_rosbot3_stack.sh` starts everything needed to drive ROSbot 3 on the recorded path, then gives you a menu to start and stop driving. This is the recommended way to run the robot. The manual steps in [section 2](#2-running-the-robot-on-a-recorded-path) do the same thing by hand.
+
+### Before you start
+
+- The robot is powered on and placed on the track. The script prints the battery voltage at startup.
+- `config/` contains a recorded map (`track_map.yaml`) and a smoothed path (`smoothed_trajectory.csv`). See [section 1](#1-recording-a-path).
+- The terminal does **not** have the `.venv` active. The script refuses to start if it does. See [The `.venv` is opt-in](#the-venv-is-opt-in).
+- `ROS_DOMAIN_ID=0`. This is set in `~/.bashrc` on `rosbot-server`.
+
+### Launch
+
+```bash
+cd ~/rosbot3
+./run_rosbot3_stack.sh
+```
+
+Run it in your own interactive terminal. The menu reads single keypresses, and the E-Stop has to stay one key away from your hands.
+
+> **The robot moves during startup.** To localize, the script rotates the robot in place for about 16 seconds (8 s each way). Make sure it has room to turn before you launch. Relaunching localization with `l` does the same.
+
+### What the launcher starts
+
+| Step | What happens | Log in `/tmp/rosbot3_run_logs/` |
+|---|---|---|
+| 1 | Checks that the robot is online and prints the battery voltage | — |
+| 2 | `tf_relay.py` | `tf_relay.log` |
+| 3 | AMCL localization (`nav2_bringup localization_launch.py` with `config/track_map.yaml` and `config/amcl_params.yaml`): activates `map_server` and `amcl`, requests global localization, then rotates the robot to converge | `localization.log` |
+| 4 | V2V gate (`rosbot_v2v_gate.py`) | `gate.log` |
+| 5 | V2V broadcaster (`rosbot_v2v_broadcaster.py`), sending to QCar 2 at `192.168.0.53` | `broadcaster.log` |
+| 6 | Dashboard (`v2v_dashboard.py --role rosbot3`), on port `8090` | `dashboard.log` |
+| 7 | Checks for duplicate processes | — |
+
+The previous run's logs are kept with a `.prev` suffix. The logs are in `/tmp`, so a reboot clears them.
+
+The follower doesn't start until you press `r`. It publishes on `/rosbot3/cmd_vel_raw`, and the V2V gate passes the commands on to `/rosbot3/cmd_vel`, which drives the robot. Its log is `follower.log`.
+
+### Drive
+
+Once the script prints `stack up. Nothing drives until you press 'r' (resume).`, use the menu:
+
+| Key | Action |
+|---|---|
+| `r` | **Resume**: starts `trajectory_follower_node.py`, which drives the recorded path. Refused if localization isn't running. |
+| `e` | **E-Stop**: stops the follower (SIGINT, then SIGKILL if it hasn't exited after 5 s) and publishes a zero velocity on `/rosbot3/cmd_vel`. |
+| `l` | **Relaunch localization**, if AMCL gets lost or duplicated. E-Stop first. The robot rotates again. |
+| `s` | **Status**: robot online, battery, which processes are running, number of `/amcl` nodes, last follower line, duplicate check. |
+| `q` | **Quit**: stops the follower, sends a zero velocity and shuts everything down. |
+
+`Ctrl+C` also runs the full shutdown.
+
+If the script warns that AMCL didn't converge after rotating, press `l` to relaunch localization, or rotate the robot by hand before pressing `r`.
+
 ## 1. Recording a Path
 
 To start recording a path, open separate terminals and run the following commands:
@@ -170,7 +224,7 @@ _(Note: Please ensure the path to `smooth.py` is correct for your setup)._
 
 ## 2. Running the Robot on a Recorded Path
 
-To run the robot autonomously on the path you just recorded, use the following commands across four terminals:
+The easiest way is [`run_rosbot3_stack.sh`](#quick-start-run_rosbot3_stacksh). To run the robot autonomously on the path you just recorded by hand instead, use the following commands across four terminals:
 
 **Terminal 1: Start TF Relay**
 
@@ -218,32 +272,34 @@ plain HTTP by IP, not ROS/DDS, so it works even though the two robots
 deliberately keep separate ROS graphs (see `rosbot_v2v_broadcaster.py`'s
 docstring for why).
 
-**On ROSbot 3** (run from `rosbot-server`, actual LAN IP `192.168.0.100`
-— **not** `192.168.0.110`, that's a different device):
+**Addresses.** Open either URL from a browser on the lab network. Both show the same combined page.
+
+| Dashboard | Runs on | Started by | URL |
+|---|---|---|---|
+| ROSbot 3 | `rosbot-server` (`192.168.0.100`) | `run_rosbot3_stack.sh` | **`http://192.168.0.100:8090/`** |
+| QCar 2 | QCar 2 (`192.168.0.53`) | `run_qcar2_stack.sh` on the QCar 2 | **`http://192.168.0.53:8090/`** |
+
+`rosbot-server` is `192.168.0.100`, **not** `192.168.0.110`, which is a different device.
+
+Both launchers start their dashboard automatically. To start the ROSbot 3 dashboard by hand instead:
 
 ```bash
 cd ~/rosbot3
-python3 rosbot_lane/v2v_dashboard.py --role rosbot3 --peer-host 192.168.0.53
+python3 rosbot_lane/v2v_dashboard.py --role rosbot3 --peer-host 192.168.0.53 \
+  --trajectory config/smoothed_trajectory.csv
 ```
-
-**On QCar 2** (`~/qcar_v2v_ws`, `ROS_DOMAIN_ID=42`, `ROS_LOCALHOST_ONLY=1`
-sourced first — see the QCar 2 side's own docs for the exact sourcing):
-
-```bash
-cd ~/qcar_v2v_ws
-python3 v2v_dashboard.py --role qcar2 --peer-host 192.168.0.100
-```
-
-Then open **either** `http://192.168.0.100:8090/` or
-`http://192.168.0.53:8090/` from a laptop browser on the lab network —
-both URLs show the same combined dashboard (both cameras, both robots'
-V2V state, both robots' active nodes).
 
 Notes:
 - Both instances must be running for the combined view to fully populate
   — if one side isn't up yet, that side's camera panel and node list will
   just be empty/unreachable until it starts (the page doesn't crash,
   fields show `--`).
+- The page fits on one screen: both camera feeds at equal height, the V2V
+  link and safety tables (with the **Gap (m)** row highlighted), and a live
+  track map. Below 1100 px width it switches to a scrolling layout.
+- The page is generated by the running process. After editing
+  `v2v_dashboard.py`, restart the dashboard; refreshing the browser alone
+  changes nothing.
 - Port is `8090` by default (`--port` to change; if you change it on one
   side, pass `--peer-port` on the other so they still find each other).
 - Plain HTTP, no authentication — trusted lab network only, same caveat
